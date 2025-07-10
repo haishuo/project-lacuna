@@ -1,0 +1,14 @@
+model_name: lacuna-moe
+base_model: microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract
+statistical_features_dim: 128
+hidden_dim: 512
+expert_output_dim: 256
+num_experts: 5
+domains:
+- clinical_trials
+- surveys
+- longitudinal
+- observational
+- experimental
+max_sequence_length: 512
+dropout_rate: 0.1

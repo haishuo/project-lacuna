@@ -1,0 +1,22 @@
+Package: lacuna
+Type: Package
+Title: LLM-Augmented Classification of UNobserved Assumptions
+Version: 0.1.0
+Author: LACUNA Development Team
+Maintainer: Your Name <your.email@example.com>
+Description: R interface for LACUNA missing data mechanism assessment.
+    Provides tools for quantifying uncertainty about MAR vs MNAR assumptions
+    in missing data analysis.
+License: MIT
+Encoding: UTF-8
+LazyData: true
+Imports:
+    reticulate,
+    ggplot2,
+    dplyr,
+    plotly
+Suggests:
+    knitr,
+    rmarkdown,
+    testthat
+RoxygenNote: 7.2.0
