@@ -57,8 +57,8 @@ If you use LACUNA in your research, please cite:
 ```bibtex
 @software{lacuna2024,
   title={LACUNA: LLM-Augmented Classification of UNobserved Assumptions},
-  author={LACUNA Development Team},
-  year={2024},
+  author={Hai-Shuo Shu},
+  year={2025},
   url={https://github.com/username/project-lacuna}
 }
 ```
