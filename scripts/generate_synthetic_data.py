@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Generate synthetic datasets with known MAR/MNAR mechanisms"""
+"""Generate synthetic training data
 
-import sys
-sys.path.append('/mnt/projects/project_lacuna')
+Usage:
+    python scripts/generate_synthetic_data.py \
+        --output-dir /mnt/data/project_lacuna/synthetic \
+        --n-examples 10000
+"""
 
-from lacuna.utils.forge_config import LACUNAForgeConfig
-from lacuna.data.simulators import *
+import argparse
+from pathlib import Path
+
 
 def main():
-    """Generate comprehensive synthetic training dataset"""
-    config = LACUNAForgeConfig()
+    parser = argparse.ArgumentParser(description="Generate synthetic data")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--n-examples", type=int, required=True)
+    parser.add_argument("--domains", type=str, required=True)
+    parser.add_argument("--n-bins", type=int, required=True)
     
-    # TODO: Initialize domain-specific data generators
-    # TODO: Generate MCAR/MAR/MNAR examples for each domain
-    # TODO: Save with proper labeling and metadata
-    # TODO: Create train/val/test splits
+    args = parser.parse_args()
     
-    print("📊 Generating synthetic datasets...")
-    
+    # TODO: Implement generation
+    # See spec section 5.1
+    print(f"Generating {args.n_examples} examples...")
+    print(f"Output: {args.output_dir}")
+
+
 if __name__ == "__main__":
     main()

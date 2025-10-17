@@ -1,1 +1,1 @@
-# Inference pipeline
+"""Module initialization"""

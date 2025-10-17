@@ -1,1 +1,1 @@
-# Model architectures
+"""Module initialization"""

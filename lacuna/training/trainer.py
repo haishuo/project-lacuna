@@ -1,23 +1,23 @@
 """
-lacuna.surveyexpert
+lacuna.lacunatrainer
 
-Purpose: survey research
+Purpose: training loop and multi-task loss
 
 Design Principles:
 - UNIX Philosophy: Do ONE thing well
 - No defaults (except top-level config)
 - Trust neighbors (no redundant validation)
 - Fail fast and loud
-- Target: <300 lines
+- Target: <400 lines
 
-Spec Reference: Section 4.6
+Spec Reference: Section 5.2
 """
 
 # TODO: Add imports
 
 
-class SurveyExpert:
-    """TODO: Implement SurveyExpert"""
+class LacunaTrainer:
+    """TODO: Implement LacunaTrainer"""
     
     def __init__(self, config):
         # TODO: Validate config

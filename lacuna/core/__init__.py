@@ -1,1 +1,1 @@
-# Core LACUNA components
+"""Module initialization"""

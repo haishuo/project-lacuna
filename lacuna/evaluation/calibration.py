@@ -1,23 +1,23 @@
 """
-lacuna.surveyexpert
+lacuna.calibrator
 
-Purpose: survey research
+Purpose: probability calibration
 
 Design Principles:
 - UNIX Philosophy: Do ONE thing well
 - No defaults (except top-level config)
 - Trust neighbors (no redundant validation)
 - Fail fast and loud
-- Target: <300 lines
+- Target: <200 lines
 
-Spec Reference: Section 4.6
+Spec Reference: Section 5.3
 """
 
 # TODO: Add imports
 
 
-class SurveyExpert:
-    """TODO: Implement SurveyExpert"""
+class Calibrator:
+    """TODO: Implement Calibrator"""
     
     def __init__(self, config):
         # TODO: Validate config

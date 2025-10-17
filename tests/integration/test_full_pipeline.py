@@ -1,23 +1,22 @@
 """
-Tests for MCARDetector
+Tests for Full Pipeline
 
 Testing Strategy:
 - Trust inputs from neighbors (don't re-validate)
 - Test only this component's logic
 - Clear, focused test cases
 
-Spec Reference: Section 4.3
+Spec Reference: Section 4.1
 """
 
 import pytest
 import pandas as pd
-import numpy as np
-from lacuna.core.mcar_detector import MCARDetector
-from lacuna.config import MCARConfig
+from lacuna.inference.pipeline import LacunaPipeline
+from lacuna.config import LacunaConfig
 
 
-class TestMCARDetector:
-    """Test suite for MCARDetector"""
+class TestLacunaPipeline:
+    """Test suite for LacunaPipeline"""
     
     def setup_method(self):
         """Setup test fixtures"""

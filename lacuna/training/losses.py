@@ -1,23 +1,23 @@
 """
-lacuna.surveyexpert
+lacuna.lacunalosses
 
-Purpose: survey research
+Purpose: loss functions for training
 
 Design Principles:
 - UNIX Philosophy: Do ONE thing well
 - No defaults (except top-level config)
 - Trust neighbors (no redundant validation)
 - Fail fast and loud
-- Target: <300 lines
+- Target: <200 lines
 
-Spec Reference: Section 4.6
+Spec Reference: Section 5.2
 """
 
 # TODO: Add imports
 
 
-class SurveyExpert:
-    """TODO: Implement SurveyExpert"""
+class LacunaLosses:
+    """TODO: Implement LacunaLosses"""
     
     def __init__(self, config):
         # TODO: Validate config

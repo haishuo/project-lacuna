@@ -1,3 +1,0 @@
-[console_scripts]
-lacuna-analyze = lacuna.inference.pipeline:main
-lacuna-train = lacuna.training.trainer:main

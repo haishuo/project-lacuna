@@ -1,23 +1,23 @@
 """
-lacuna.surveyexpert
+lacuna.logger
 
-Purpose: survey research
+Purpose: logging utilities
 
 Design Principles:
 - UNIX Philosophy: Do ONE thing well
 - No defaults (except top-level config)
 - Trust neighbors (no redundant validation)
 - Fail fast and loud
-- Target: <300 lines
+- Target: <100 lines
 
-Spec Reference: Section 4.6
+Spec Reference: Section N/A
 """
 
 # TODO: Add imports
 
 
-class SurveyExpert:
-    """TODO: Implement SurveyExpert"""
+class Logger:
+    """TODO: Implement Logger"""
     
     def __init__(self, config):
         # TODO: Validate config

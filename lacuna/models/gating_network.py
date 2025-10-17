@@ -1,20 +1,51 @@
-"""MoE routing/gating network"""
+"""
+lacuna.models.gating_network
 
+Purpose: Route inputs to domain experts
+
+Design Principles:
+- UNIX Philosophy: Do ONE thing well
+- No defaults (except top-level config)
+- Trust neighbors (no redundant validation)
+- Fail fast and loud
+- Target: <200 lines
+
+Spec Reference: Section 4.7
+"""
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class GatingNetwork(nn.Module):
-    """Smart router for domain expert selection"""
+    """Routes inputs to domain experts
     
-    def __init__(self, context_dim, stats_dim, num_experts):
+    Design: Trust encoder produced valid representations
+    """
+    
+    def __init__(self, config):
+        """
+        Args:
+            config: GatingConfig (required fields)
+        """
+        if config.input_dim is None:
+            raise ValueError("config.input_dim required")
+        
         super().__init__()
-        # TODO: Initialize domain classification network
-        # TODO: Add temperature parameter for sharpness control
-        pass
+        # TODO: Build routing network
+        # See spec section 4.7
     
-    def forward(self, context_repr, stats_repr, metadata):
-        """Compute expert weights for routing"""
-        # TODO: Combine representations
-        # TODO: Compute expert logits
-        # TODO: Apply temperature scaling and softmax
-        pass
+    def forward(self, pooled_repr: torch.Tensor, domain_hint: str) -> torch.Tensor:
+        """Compute expert routing weights
+        
+        Args:
+            pooled_repr: Encoder output (trust it's valid)
+            domain_hint: Domain string (trust it's valid)
+        
+        Returns:
+            Expert weights (batch, num_experts)
+        """
+        # TODO: Implement routing
+        raise NotImplementedError("See spec section 4.7")
+

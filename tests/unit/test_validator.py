@@ -1,23 +1,23 @@
 """
-Tests for MCARDetector
+Tests for Validator
 
 Testing Strategy:
 - Trust inputs from neighbors (don't re-validate)
 - Test only this component's logic
 - Clear, focused test cases
 
-Spec Reference: Section 4.3
+Spec Reference: Section 4.2
 """
 
 import pytest
 import pandas as pd
 import numpy as np
-from lacuna.core.mcar_detector import MCARDetector
-from lacuna.config import MCARConfig
+from lacuna.ingestion.validator import Validator
+from lacuna.config import ValidatorConfig
 
 
-class TestMCARDetector:
-    """Test suite for MCARDetector"""
+class TestValidator:
+    """Test suite for Validator"""
     
     def setup_method(self):
         """Setup test fixtures"""

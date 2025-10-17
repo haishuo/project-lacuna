@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""Train LACUNA MoE model on synthetic data"""
+"""Train Lacuna MoE model
 
-import sys
-sys.path.append('/mnt/projects/project_lacuna')
+Usage:
+    python scripts/train_moe_model.py \
+        --config configs/training/synthetic_training.yaml \
+        --data-dir /mnt/data/project_lacuna/synthetic
+"""
 
-from lacuna.utils.forge_config import LACUNAForgeConfig
-from lacuna.training.trainer import LACUNATrainer
+import argparse
+from pathlib import Path
+
 
 def main():
-    """Main training script"""
-    config = LACUNAForgeConfig()
+    parser = argparse.ArgumentParser(description="Train Lacuna model")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, required=True)
+    parser.add_argument("--epochs", type=int, required=True)
     
-    # TODO: Initialize trainer with Forge paths
-    # TODO: Load synthetic training data
-    # TODO: Configure training parameters
-    # TODO: Start training with checkpointing
+    args = parser.parse_args()
     
-    print("🚀 Starting LACUNA MoE training...")
-    
+    # TODO: Implement training
+    # See spec section 5.2
+    print(f"Training with config: {args.config}")
+    print(f"Data: {args.data_dir}")
+
+
 if __name__ == "__main__":
     main()

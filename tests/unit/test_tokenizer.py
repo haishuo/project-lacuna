@@ -1,23 +1,22 @@
 """
-Tests for MCARDetector
+Tests for Tokenizer
 
 Testing Strategy:
 - Trust inputs from neighbors (don't re-validate)
 - Test only this component's logic
 - Clear, focused test cases
 
-Spec Reference: Section 4.3
+Spec Reference: Section 4.4
 """
 
 import pytest
 import pandas as pd
-import numpy as np
-from lacuna.core.mcar_detector import MCARDetector
-from lacuna.config import MCARConfig
+from lacuna.data.tokenizer import Tokenizer
+from lacuna.config import TokenizerConfig
 
 
-class TestMCARDetector:
-    """Test suite for MCARDetector"""
+class TestTokenizer:
+    """Test suite for Tokenizer"""
     
     def setup_method(self):
         """Setup test fixtures"""

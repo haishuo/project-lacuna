@@ -1,13 +1,27 @@
-"""Forge-specific path management for Project LACUNA"""
+"""
+lacuna.utils.forge_config
+
+Purpose: Forge-specific path configuration
+
+Design Principles:
+- UNIX Philosophy: Do ONE thing well
+- No defaults (except top-level config)
+- Trust neighbors (no redundant validation)
+- Fail fast and loud
+- Target: <150 lines
+
+Spec Reference: Section Appendix
+"""
 
 from pathlib import Path
 
-class LACUNAForgeConfig:
-    """Forge-specific path management for Project LACUNA"""
+
+class ForgeConfig:
+    """Forge-specific path management"""
     
     # Base directories (following Forge conventions)
     PROJECT_ROOT = Path("/mnt/projects/project_lacuna")
-    DATA_ROOT = Path("/mnt/data/project_lacuna") 
+    DATA_ROOT = Path("/mnt/data/project_lacuna")
     ARTIFACTS_ROOT = Path("/mnt/artifacts/project_lacuna")
     
     # Source code paths
@@ -40,15 +54,4 @@ class LACUNAForgeConfig:
                 path = getattr(cls, attr_name)
                 if isinstance(path, Path):
                     path.mkdir(parents=True, exist_ok=True)
-                    
-    @classmethod
-    def get_synthetic_data_path(cls, mechanism, domain):
-        """Get path for specific synthetic dataset"""
-        return cls.SYNTHETIC_DATA / f"{mechanism}_datasets" / domain
-        
-    @classmethod
-    def get_model_checkpoint_path(cls, model_name, epoch=None):
-        """Get path for model checkpoint"""
-        if epoch:
-            return cls.CHECKPOINTS_DIR / f"{model_name}_epoch_{epoch:02d}"
-        return cls.CHECKPOINTS_DIR / f"{model_name}_final"
+

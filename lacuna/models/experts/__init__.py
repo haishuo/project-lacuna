@@ -1,1 +1,1 @@
-# Domain experts
+"""Module initialization"""

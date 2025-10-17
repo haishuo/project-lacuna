@@ -1,7 +1,7 @@
 """
-lacuna.surveyexpert
+lacuna.visualizer
 
-Purpose: survey research
+Purpose: attention maps and plots
 
 Design Principles:
 - UNIX Philosophy: Do ONE thing well
@@ -10,14 +10,14 @@ Design Principles:
 - Fail fast and loud
 - Target: <300 lines
 
-Spec Reference: Section 4.6
+Spec Reference: Section N/A
 """
 
 # TODO: Add imports
 
 
-class SurveyExpert:
-    """TODO: Implement SurveyExpert"""
+class Visualizer:
+    """TODO: Implement Visualizer"""
     
     def __init__(self, config):
         # TODO: Validate config
