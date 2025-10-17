@@ -29,7 +29,6 @@ class ValidatorConfig:
 class MCARConfig:
     """Configuration for MCAR testing"""
     alpha: float = 0.05  # DEFAULT OK here
-    method: str = 'little'  # DEFAULT OK here
 
 
 @dataclass

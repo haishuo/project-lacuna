@@ -62,7 +62,7 @@ class LacunaPipeline:
                 'MAR': 0.0,
                 'MNAR': 0.0,
                 'confidence': mcar_result['confidence'],
-                'method': 'mcar_test'
+                'method': 'little_mcar_test'
             }
         
         # TODO: Complete pipeline
