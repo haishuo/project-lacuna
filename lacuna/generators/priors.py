@@ -1,0 +1,1 @@
+"""Prior distribution over generators."""
