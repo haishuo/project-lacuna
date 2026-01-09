@@ -147,10 +147,10 @@ class TestComputeAccuracy:
     
     def test_partial_accuracy(self):
         logits = torch.tensor([[10.0, 0.0], [0.0, 10.0], [10.0, 0.0], [0.0, 10.0]])
-        targets = torch.tensor([0, 0, 0, 1])  # 2 correct, 2 wrong
+        targets = torch.tensor([0, 0, 0, 1])  # 3 correct (0,2,3), 1 wrong (1)
         
         acc = compute_accuracy(logits, targets)
-        assert acc == 0.5
+        assert acc == 0.75
 
 
 class TestTopkAccuracy:

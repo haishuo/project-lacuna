@@ -17,10 +17,9 @@ from lacuna.config.schema import LacunaConfig
 def make_dummy_model():
     """Create small model for testing."""
     cfg = LacunaConfig.minimal()
-    K = 6
     class_mapping = torch.tensor([0, 0, 1, 1, 2, 2])
     
-    return LacunaModel.from_config(cfg, K, class_mapping)
+    return LacunaModel.from_config(cfg, class_mapping)
 
 
 def make_dummy_dataloader(n_batches: int = 5, batch_size: int = 8):
@@ -120,9 +119,18 @@ class TestTrainerStep:
         batches = make_dummy_dataloader(n_batches=1)
         metrics = trainer.train_step(batches[0])
         
+        # clip_grad_norm_ returns the ORIGINAL norm before clipping
+        # Just verify the metric is recorded
         assert "grad_norm" in metrics
-        # Grad norm should be clipped
-        assert metrics["grad_norm"] <= 0.1 + 1e-6
+        assert metrics["grad_norm"] >= 0
+        
+        # Verify clipping actually happened by checking gradient magnitudes
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        total_norm = total_norm ** 0.5
+        assert total_norm <= 0.1 + 1e-5, f"Gradients not clipped: {total_norm}"
 
 
 class TestTrainerValidation:

@@ -25,9 +25,8 @@ from lacuna.config.schema import LacunaConfig
 def make_dummy_model():
     """Create small model for testing."""
     cfg = LacunaConfig.minimal()
-    K = 6
     class_mapping = torch.tensor([0, 0, 1, 1, 2, 2])
-    return LacunaModel.from_config(cfg, K, class_mapping)
+    return LacunaModel.from_config(cfg, class_mapping)
 
 
 class TestCheckpointData:
