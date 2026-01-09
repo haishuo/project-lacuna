@@ -116,7 +116,6 @@ dmypy.json
 
 # Model checkpoints and artifacts
 checkpoints/
-models/
 wandb/
 
 # Data files (should be in /mnt/data, not in repo)
