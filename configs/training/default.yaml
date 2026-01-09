@@ -1,1 +1,39 @@
-# Default training configuration
+# Default training config for full runs
+# Usage: python scripts/train.py --config configs/training/default.yaml --device cuda
+
+seed: 42
+device: cuda
+output_dir: /mnt/artifacts/project_lacuna/runs
+
+data:
+  n_range: [50, 500]
+  d_range: [3, 20]
+  max_cols: 32
+  max_rows: 256
+
+model:
+  hidden_dim: 128
+  evidence_dim: 64
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+training:
+  epochs: 50
+  batch_size: 32
+  batches_per_epoch: 100
+  val_batches: 20
+  lr: 0.0001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_steps: 200
+  patience: 10
+  min_delta: 0.0001
+
+generator:
+  n_generators: 6
+
+loss_matrix:
+  - [0.0, 0.3, 1.0]   # Green action
+  - [0.2, 0.0, 0.2]   # Yellow action  
+  - [1.0, 0.3, 0.0]   # Red action

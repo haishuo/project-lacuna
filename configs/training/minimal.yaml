@@ -1,0 +1,34 @@
+# Minimal config for quick testing (~1-2 min on GPU)
+# Usage: python scripts/train.py --config configs/training/minimal.yaml
+
+seed: 42
+device: cuda
+output_dir: /mnt/artifacts/project_lacuna/runs
+
+data:
+  n_range: [50, 100]
+  d_range: [3, 8]
+  max_cols: 16
+  max_rows: 64
+
+model:
+  hidden_dim: 64
+  evidence_dim: 32
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+training:
+  epochs: 5
+  batch_size: 8
+  batches_per_epoch: 20
+  val_batches: 5
+  lr: 0.001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_steps: 10
+  patience: 3
+  min_delta: 0.001
+
+generator:
+  n_generators: 6
