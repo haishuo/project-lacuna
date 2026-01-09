@@ -48,3 +48,15 @@ __all__ = [
     "collate_fn",
     "SyntheticDataLoader",
 ]
+
+# Catalog imports (if not already present)
+try:
+    from .catalog import (
+        DatasetInfo,
+        DatasetCatalog,
+        create_default_catalog,
+        DEFAULT_RAW_DIR,
+        DEFAULT_PROCESSED_DIR,
+    )
+except ImportError:
+    pass

@@ -1,0 +1,37 @@
+# Minimal semi-synthetic config for quick testing
+# Usage: python scripts/train_semisynthetic.py --config configs/training/semisynthetic_minimal.yaml
+
+seed: 42
+device: cpu
+output_dir: /mnt/artifacts/project_lacuna/runs
+
+data:
+  max_rows: 64
+  max_cols: 16
+  train_datasets:
+    - diabetes
+    - wine
+  val_datasets:
+    - iris
+
+model:
+  hidden_dim: 64
+  evidence_dim: 32
+  n_layers: 2
+  n_heads: 4
+  dropout: 0.1
+
+training:
+  epochs: 5
+  batch_size: 8
+  batches_per_epoch: 10
+  val_batches: 3
+  lr: 0.001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_steps: 10
+  patience: 3
+  min_delta: 0.001
+
+generator:
+  n_generators: 6
