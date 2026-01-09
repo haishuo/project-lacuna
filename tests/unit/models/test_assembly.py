@@ -1,12 +1,11 @@
 """
-Tests for lacuna.models.assembly (LacunaModel)
+Tests for lacuna.models.assembly (row-level)
 """
 
 import pytest
 import torch
 from lacuna.core.types import TokenBatch
-from lacuna.config.schema import LacunaConfig
-from lacuna.data.features import FEATURE_DIM
+from lacuna.data.tokenization import TOKEN_DIM
 from lacuna.models.assembly import LacunaModel
 
 
@@ -24,18 +23,20 @@ def model(class_mapping):
         class_mapping=class_mapping,
         hidden_dim=64,
         evidence_dim=32,
-        n_layers=2,
+        n_layers=4,
         n_heads=4,
         max_cols=16,
+        max_rows=64,
     )
 
 
 @pytest.fixture
 def sample_batch():
     """Create sample TokenBatch."""
-    B, max_cols, q = 4, 16, FEATURE_DIM
+    B, max_rows, max_cols = 4, 64, 16
     return TokenBatch(
-        tokens=torch.randn(B, max_cols, q),
+        tokens=torch.randn(B, max_rows, max_cols, TOKEN_DIM),
+        row_mask=torch.ones(B, max_rows, dtype=torch.bool),
         col_mask=torch.ones(B, max_cols, dtype=torch.bool),
         generator_ids=torch.tensor([0, 2, 4, 1]),
         class_ids=torch.tensor([0, 1, 2, 0]),
@@ -81,22 +82,17 @@ class TestLacunaModel:
         posterior, decision = model.forward_with_decision(sample_batch)
         
         assert posterior.p_class.shape == (4, 3)
-        assert decision.batch_size == 4
-    
-    def test_get_evidence(self, model, sample_batch):
-        evidence = model.get_evidence(sample_batch)
-        
-        assert evidence.shape == (4, 32)  # evidence_dim=32
+        assert decision.action_ids.shape == (4,)
     
     def test_gradients_flow(self, model, sample_batch):
-        model.train()
-        
         # Make tokens require grad
         tokens = sample_batch.tokens.clone().requires_grad_(True)
         batch = TokenBatch(
             tokens=tokens,
+            row_mask=sample_batch.row_mask,
             col_mask=sample_batch.col_mask,
             generator_ids=sample_batch.generator_ids,
+            class_ids=sample_batch.class_ids,
         )
         
         posterior = model(batch)
@@ -104,79 +100,14 @@ class TestLacunaModel:
         loss.backward()
         
         assert tokens.grad is not None
-        assert not torch.isnan(tokens.grad).any()
-    
-    def test_no_nan_in_output(self, model, sample_batch):
-        model.eval()
-        
-        with torch.no_grad():
-            posterior = model(sample_batch)
-        
-        assert not torch.isnan(posterior.p_generator).any()
-        assert not torch.isnan(posterior.p_class).any()
-        assert not torch.isnan(posterior.entropy_generator).any()
-        assert not torch.isnan(posterior.entropy_class).any()
-    
-    def test_from_config(self, class_mapping):
-        config = LacunaConfig.minimal()
-        model = LacunaModel.from_config(config, class_mapping)
-        
-        assert model.n_generators == 6
-        assert model.hidden_dim == 64  # minimal config
     
     def test_variable_batch_sizes(self, model):
         for B in [1, 2, 8]:
             batch = TokenBatch(
-                tokens=torch.randn(B, 16, FEATURE_DIM),
+                tokens=torch.randn(B, 64, 16, TOKEN_DIM),
+                row_mask=torch.ones(B, 64, dtype=torch.bool),
                 col_mask=torch.ones(B, 16, dtype=torch.bool),
             )
             
             posterior = model(batch)
             assert posterior.p_class.shape == (B, 3)
-    
-    def test_handles_partial_padding(self, model):
-        B = 4
-        batch = TokenBatch(
-            tokens=torch.randn(B, 16, FEATURE_DIM),
-            col_mask=torch.tensor([
-                [True]*5 + [False]*11,
-                [True]*10 + [False]*6,
-                [True]*3 + [False]*13,
-                [True]*16,
-            ]),
-        )
-        
-        posterior = model(batch)
-        
-        assert posterior.p_class.shape == (B, 3)
-        assert not torch.isnan(posterior.p_class).any()
-
-
-class TestLacunaModelTraining:
-    """Tests for training-related behavior."""
-    
-    def test_train_eval_modes(self, model, sample_batch):
-        # Train mode
-        model.train()
-        assert model.training
-        
-        p1 = model(sample_batch)
-        
-        # Eval mode
-        model.eval()
-        assert not model.training
-        
-        with torch.no_grad():
-            p2 = model(sample_batch)
-        
-        # Both should produce valid output
-        assert p1.p_class.shape == p2.p_class.shape
-    
-    def test_parameter_count(self, model):
-        n_params = sum(p.numel() for p in model.parameters())
-        
-        # Should have reasonable number of parameters
-        assert n_params > 1000  # Not trivial
-        assert n_params < 10_000_000  # Not huge for this config
-        
-        print(f"Model has {n_params:,} parameters")

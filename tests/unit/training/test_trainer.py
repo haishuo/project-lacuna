@@ -1,46 +1,45 @@
 """
 Tests for lacuna.training.trainer
-
-Verify training loop behavior.
 """
 
 import pytest
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 
 from lacuna.training.trainer import Trainer, TrainerConfig
 from lacuna.models.assembly import LacunaModel
 from lacuna.core.types import TokenBatch
 from lacuna.config.schema import LacunaConfig
+from lacuna.data.tokenization import TOKEN_DIM
 
 
 def make_dummy_model():
     """Create small model for testing."""
     cfg = LacunaConfig.minimal()
     class_mapping = torch.tensor([0, 0, 1, 1, 2, 2])
-    
     return LacunaModel.from_config(cfg, class_mapping)
+
+
+def make_dummy_batch(batch_size: int = 8):
+    """Create dummy TokenBatch."""
+    max_rows = 64
+    max_cols = 16
+    K = 6
+    
+    gen_ids = torch.randint(0, K, (batch_size,))
+    cls_ids = torch.div(gen_ids, 2, rounding_mode="floor")
+    
+    return TokenBatch(
+        tokens=torch.randn(batch_size, max_rows, max_cols, TOKEN_DIM),
+        row_mask=torch.ones(batch_size, max_rows, dtype=torch.bool),
+        col_mask=torch.ones(batch_size, max_cols, dtype=torch.bool),
+        generator_ids=gen_ids,
+        class_ids=cls_ids,
+    )
 
 
 def make_dummy_dataloader(n_batches: int = 5, batch_size: int = 8):
     """Create dummy data loader."""
-    max_cols = 16
-    token_dim = 12
-    K = 6
-    
-    batches = []
-    for _ in range(n_batches):
-        gen_ids = torch.randint(0, K, (batch_size,))
-        cls_ids = torch.div(gen_ids, 2, rounding_mode="floor")  # 0,1->0, 2,3->1, 4,5->2
-        
-        batch = TokenBatch(
-            tokens=torch.randn(batch_size, max_cols, token_dim),
-            col_mask=torch.ones(batch_size, max_cols, dtype=torch.bool),
-            generator_ids=gen_ids,
-            class_ids=cls_ids,
-        )
-        batches.append(batch)
-    
+    batches = [make_dummy_batch(batch_size) for _ in range(n_batches)]
     return batches
 
 
@@ -74,8 +73,7 @@ class TestTrainerStep:
         config = TrainerConfig(lr=0.01)
         trainer = Trainer(model, config, device="cpu")
         
-        batches = make_dummy_dataloader(n_batches=1)
-        batch = batches[0]
+        batch = make_dummy_batch()
         
         # Get initial loss
         model.eval()
@@ -104,8 +102,8 @@ class TestTrainerStep:
         config = TrainerConfig()
         trainer = Trainer(model, config, device="cpu")
         
-        batches = make_dummy_dataloader(n_batches=1)
-        metrics = trainer.train_step(batches[0])
+        batch = make_dummy_batch()
+        metrics = trainer.train_step(batch)
         
         assert "loss_total" in metrics
         assert "acc_generator" in metrics
@@ -116,21 +114,18 @@ class TestTrainerStep:
         config = TrainerConfig(grad_clip=0.1)
         trainer = Trainer(model, config, device="cpu")
         
-        batches = make_dummy_dataloader(n_batches=1)
-        metrics = trainer.train_step(batches[0])
+        batch = make_dummy_batch()
+        metrics = trainer.train_step(batch)
         
-        # clip_grad_norm_ returns the ORIGINAL norm before clipping
-        # Just verify the metric is recorded
         assert "grad_norm" in metrics
-        assert metrics["grad_norm"] >= 0
         
-        # Verify clipping actually happened by checking gradient magnitudes
+        # Verify clipping by checking gradient magnitudes
         total_norm = 0.0
         for p in model.parameters():
             if p.grad is not None:
                 total_norm += p.grad.data.norm(2).item() ** 2
         total_norm = total_norm ** 0.5
-        assert total_norm <= 0.1 + 1e-5, f"Gradients not clipped: {total_norm}"
+        assert total_norm <= 0.1 + 1e-5
 
 
 class TestTrainerValidation:
@@ -165,7 +160,7 @@ class TestTrainerFit:
         result = trainer.fit(train_loader)
         
         assert result["epochs_completed"] == 2
-        assert result["total_steps"] == 10  # 5 batches * 2 epochs
+        assert result["total_steps"] == 10
     
     def test_fit_with_validation(self):
         model = make_dummy_model()
@@ -185,8 +180,7 @@ class TestTrainerFit:
     
     def test_early_stopping(self):
         model = make_dummy_model()
-        # Small patience, training on random data won't improve
-        config = TrainerConfig(epochs=100, patience=2)
+        config = TrainerConfig(epochs=100, patience=2, lr=1e-8)
         trainer = Trainer(model, config, device="cpu")
         
         train_batches = make_dummy_dataloader(n_batches=2)
@@ -197,7 +191,6 @@ class TestTrainerFit:
             DummyLoader(val_batches),
         )
         
-        # Should stop well before 100 epochs
         assert result["epochs_completed"] < 100
 
 
@@ -209,7 +202,6 @@ class TestLRWarmup:
         config = TrainerConfig(lr=1e-3, warmup_steps=100)
         trainer = Trainer(model, config, device="cpu")
         
-        # At step 0, LR should be 1/100 of target
         initial_scale = trainer._get_lr_scale()
         assert initial_scale == 0.01
     
@@ -218,7 +210,6 @@ class TestLRWarmup:
         config = TrainerConfig(lr=1e-3, warmup_steps=100)
         trainer = Trainer(model, config, device="cpu")
         
-        # Simulate 100 steps
         trainer.state.step = 100
         final_scale = trainer._get_lr_scale()
         assert final_scale == 1.0

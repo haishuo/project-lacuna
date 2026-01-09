@@ -1,31 +1,33 @@
 """
 lacuna.config.schema
 
-Configuration schemas using dataclasses.
+Configuration dataclasses with validation.
 
-Design: All config fields have explicit types. Defaults only at top level.
+Simplified for row-level tokenization architecture.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 import torch
 
 
 @dataclass
 class DataConfig:
     """Data processing configuration."""
-    max_cols: int = 32
     n_range: Tuple[int, int] = (50, 500)
-    d_range: Tuple[int, int] = (5, 20)
-    normalization: str = "robust"  # "robust" | "standard" | "none"
+    d_range: Tuple[int, int] = (3, 20)
+    max_cols: int = 32
+    max_rows: int = 256
     
     def __post_init__(self):
-        if self.normalization not in ("robust", "standard", "none"):
-            raise ValueError(f"Invalid normalization: {self.normalization}")
         if self.n_range[0] > self.n_range[1]:
             raise ValueError("n_range[0] must be <= n_range[1]")
         if self.d_range[0] > self.d_range[1]:
             raise ValueError("d_range[0] must be <= d_range[1]")
+        if self.max_cols <= 0:
+            raise ValueError("max_cols must be positive")
+        if self.max_rows <= 0:
+            raise ValueError("max_rows must be positive")
 
 
 @dataclass
@@ -46,14 +48,17 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """Training loop configuration."""
-    batch_size: int = 64
+    """Training configuration."""
+    epochs: int = 50
+    batch_size: int = 32
+    batches_per_epoch: int = 100
+    val_batches: int = 20
     lr: float = 1e-4
     weight_decay: float = 0.01
-    epochs: int = 20
-    warmup_steps: int = 100
-    patience: int = 5
     grad_clip: float = 1.0
+    warmup_steps: int = 200
+    patience: int = 10
+    min_delta: float = 1e-4
     
     def __post_init__(self):
         if self.lr <= 0:
@@ -62,52 +67,58 @@ class TrainingConfig:
             raise ValueError("batch_size must be positive")
 
 
-@dataclass  
+@dataclass
 class GeneratorConfig:
-    """Generator system configuration."""
-    n_generators: int = 6  # Start with minimal set
-    class_balance: Tuple[float, float, float] = (0.33, 0.33, 0.34)  # MCAR, MAR, MNAR
-    
-    def __post_init__(self):
-        if abs(sum(self.class_balance) - 1.0) > 1e-6:
-            raise ValueError("class_balance must sum to 1")
+    """Generator configuration."""
+    n_generators: int = 6
 
 
 @dataclass
 class LacunaConfig:
-    """Top-level configuration.
-    
-    This is the ONLY place defaults are specified.
-    All sub-configs receive explicit values.
-    """
+    """Complete Lacuna configuration."""
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
-    
     seed: int = 42
     device: str = "cuda"
     output_dir: str = "/mnt/artifacts/project_lacuna/runs"
-    
-    # Loss matrix for decision rule [action, true_class]
-    # Rows: Green, Yellow, Red
-    # Cols: MCAR, MAR, MNAR
-    loss_matrix: List[float] = field(default_factory=lambda: [
-        0.0, 0.0, 10.0,   # Green: safe for MCAR/MAR, costly for MNAR
-        1.0, 1.0, 2.0,    # Yellow: small cost always
-        3.0, 2.0, 0.0,    # Red: costly for MCAR/MAR, free for MNAR
+    loss_matrix: List[List[float]] = field(default_factory=lambda: [
+        [0.0, 0.3, 1.0],
+        [0.2, 0.0, 0.2],
+        [1.0, 0.3, 0.0],
     ])
     
     def get_loss_matrix_tensor(self) -> torch.Tensor:
-        """Return loss matrix as [3, 3] tensor."""
-        return torch.tensor(self.loss_matrix).reshape(3, 3)
+        """Convert loss matrix to tensor."""
+        return torch.tensor(self.loss_matrix, dtype=torch.float32)
     
     @classmethod
     def minimal(cls) -> "LacunaConfig":
-        """Factory for minimal testing configuration."""
+        """Create minimal config for fast testing."""
         return cls(
-            data=DataConfig(max_cols=16, n_range=(50, 100), d_range=(3, 8)),
-            model=ModelConfig(hidden_dim=64, evidence_dim=32, n_layers=2, n_heads=2),
-            training=TrainingConfig(batch_size=16, epochs=5),
+            data=DataConfig(
+                n_range=(50, 100),
+                d_range=(3, 8),
+                max_cols=16,
+                max_rows=64,
+            ),
+            model=ModelConfig(
+                hidden_dim=64,
+                evidence_dim=32,
+                n_layers=4,
+                n_heads=4,
+                dropout=0.1,
+            ),
+            training=TrainingConfig(
+                epochs=5,
+                batch_size=8,
+                batches_per_epoch=20,
+                val_batches=5,
+                lr=1e-3,
+                warmup_steps=10,
+                patience=3,
+            ),
             generator=GeneratorConfig(n_generators=6),
+            device="cpu",
         )

@@ -2,12 +2,6 @@
 lacuna.models.assembly
 
 Full model composition: LacunaModel.
-
-Combines:
-- EvidenceEncoder: tokens -> evidence
-- GeneratorHead: evidence -> generator logits
-- Aggregator: generator posterior -> class posterior
-- Decision: class posterior -> action
 """
 
 import torch
@@ -16,35 +10,18 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 
 from lacuna.core.types import TokenBatch, PosteriorResult, Decision
-from lacuna.data.features import FEATURE_DIM
+from lacuna.data.tokenization import TOKEN_DIM
 from .encoder import EvidenceEncoder
 from .heads import GeneratorHead
 from .aggregator import (
     aggregate_to_class_posterior_efficient,
     compute_entropy,
-    compute_confidence,
 )
 from .decision import bayes_optimal_decision, DEFAULT_LOSS_MATRIX
 
 
 class LacunaModel(nn.Module):
-    """Complete Lacuna model for missingness mechanism classification.
-    
-    Architecture:
-        TokenBatch -> EvidenceEncoder -> GeneratorHead -> Aggregator -> Decision
-    
-    Args:
-        n_generators: Number of generators (K).
-        class_mapping: [K] tensor mapping generator_id -> class_id.
-        hidden_dim: Transformer hidden dimension.
-        evidence_dim: Evidence embedding dimension.
-        n_layers: Number of transformer layers.
-        n_heads: Number of attention heads.
-        dropout: Dropout rate.
-        max_cols: Maximum number of columns.
-        head_hidden_dim: Hidden dimension for classifier head (None = linear).
-        loss_matrix: [3, 3] loss matrix for decision rule.
-    """
+    """Complete Lacuna model for missingness mechanism classification."""
     
     def __init__(
         self,
@@ -56,8 +33,10 @@ class LacunaModel(nn.Module):
         n_heads: int = 4,
         dropout: float = 0.1,
         max_cols: int = 32,
+        max_rows: int = 256,
         head_hidden_dim: Optional[int] = None,
         loss_matrix: Optional[torch.Tensor] = None,
+        row_agg: str = "attention",
     ):
         super().__init__()
         
@@ -67,13 +46,15 @@ class LacunaModel(nn.Module):
         
         # Evidence encoder
         self.encoder = EvidenceEncoder(
-            token_dim=FEATURE_DIM,
+            token_dim=TOKEN_DIM,
             hidden_dim=hidden_dim,
             evidence_dim=evidence_dim,
             n_layers=n_layers,
             n_heads=n_heads,
             dropout=dropout,
             max_cols=max_cols,
+            max_rows=max_rows,
+            row_agg=row_agg,
         )
         
         # Generator classifier head
@@ -84,7 +65,7 @@ class LacunaModel(nn.Module):
             dropout=dropout,
         )
         
-        # Register class mapping as buffer (not a parameter)
+        # Register class mapping as buffer
         self.register_buffer('class_mapping', class_mapping)
         
         # Register loss matrix
@@ -93,29 +74,20 @@ class LacunaModel(nn.Module):
         self.register_buffer('loss_matrix', loss_matrix)
     
     def forward(self, batch: TokenBatch) -> PosteriorResult:
-        """Forward pass producing posteriors.
+        """Forward pass producing posteriors."""
+        evidence = self.encoder(
+            batch.tokens,
+            batch.row_mask,
+            batch.col_mask,
+        )
         
-        Args:
-            batch: TokenBatch with tokens and col_mask.
+        logits = self.head(evidence)
+        p_generator = F.softmax(logits, dim=-1)
         
-        Returns:
-            PosteriorResult with generator and class posteriors.
-        """
-        # Encode to evidence
-        evidence = self.encoder(batch.tokens, batch.col_mask)  # [B, p]
-        
-        # Get generator logits
-        logits = self.head(evidence)  # [B, K]
-        
-        # Generator posterior (softmax)
-        p_generator = F.softmax(logits, dim=-1)  # [B, K]
-        
-        # Aggregate to class posterior
         p_class = aggregate_to_class_posterior_efficient(
             p_generator, self.class_mapping
-        )  # [B, 3]
+        )
         
-        # Compute entropies
         entropy_generator = compute_entropy(p_generator, dim=-1)
         entropy_class = compute_entropy(p_class, dim=-1)
         
@@ -128,14 +100,7 @@ class LacunaModel(nn.Module):
         )
     
     def decide(self, posterior: PosteriorResult) -> Decision:
-        """Make Bayes-optimal decision from posterior.
-        
-        Args:
-            posterior: PosteriorResult from forward().
-        
-        Returns:
-            Decision with action IDs and expected risks.
-        """
+        """Make Bayes-optimal decision from posterior."""
         action_ids, expected_risks = bayes_optimal_decision(
             posterior.p_class,
             self.loss_matrix,
@@ -143,7 +108,6 @@ class LacunaModel(nn.Module):
         
         return Decision(
             action_ids=action_ids,
-            action_names=("Green", "Yellow", "Red"),
             expected_risks=expected_risks,
         )
     
@@ -151,40 +115,18 @@ class LacunaModel(nn.Module):
         self,
         batch: TokenBatch,
     ) -> Tuple[PosteriorResult, Decision]:
-        """Forward pass with decision in one call.
-        
-        Args:
-            batch: TokenBatch input.
-        
-        Returns:
-            (PosteriorResult, Decision) tuple.
-        """
+        """Forward pass with decision in one call."""
         posterior = self.forward(batch)
         decision = self.decide(posterior)
         return posterior, decision
     
     def get_evidence(self, batch: TokenBatch) -> torch.Tensor:
-        """Get evidence embedding (for analysis/visualization).
-        
-        Args:
-            batch: TokenBatch input.
-        
-        Returns:
-            [B, evidence_dim] evidence embedding.
-        """
-        return self.encoder(batch.tokens, batch.col_mask)
+        """Get evidence embedding."""
+        return self.encoder(batch.tokens, batch.row_mask, batch.col_mask)
     
     @classmethod
     def from_config(cls, config, class_mapping: torch.Tensor) -> "LacunaModel":
-        """Create model from LacunaConfig.
-        
-        Args:
-            config: LacunaConfig object.
-            class_mapping: [K] generator to class mapping.
-        
-        Returns:
-            Initialized LacunaModel.
-        """
+        """Create model from LacunaConfig."""
         return cls(
             n_generators=config.generator.n_generators,
             class_mapping=class_mapping,
@@ -194,5 +136,6 @@ class LacunaModel(nn.Module):
             n_heads=config.model.n_heads,
             dropout=config.model.dropout,
             max_cols=config.data.max_cols,
+            max_rows=config.data.max_rows,
             loss_matrix=config.get_loss_matrix_tensor(),
         )

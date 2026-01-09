@@ -13,17 +13,7 @@ from ..core.exceptions import ConfigError
 
 
 def load_config(path: Union[str, Path]) -> LacunaConfig:
-    """Load configuration from YAML file.
-    
-    Args:
-        path: Path to YAML config file.
-    
-    Returns:
-        Validated LacunaConfig object.
-    
-    Raises:
-        ConfigError: If file not found or validation fails.
-    """
+    """Load configuration from YAML file."""
     path = Path(path)
     
     if not path.exists():
@@ -39,16 +29,16 @@ def load_config(path: Union[str, Path]) -> LacunaConfig:
 
 
 def config_from_dict(d: Dict[str, Any]) -> LacunaConfig:
-    """Create LacunaConfig from dictionary.
-    
-    Args:
-        d: Dictionary with config values.
-    
-    Returns:
-        Validated LacunaConfig object.
-    """
+    """Create LacunaConfig from dictionary."""
     try:
-        data = DataConfig(**d.get("data", {}))
+        data_dict = d.get("data", {})
+        # Convert lists to tuples for dataclass
+        if "n_range" in data_dict and isinstance(data_dict["n_range"], list):
+            data_dict["n_range"] = tuple(data_dict["n_range"])
+        if "d_range" in data_dict and isinstance(data_dict["d_range"], list):
+            data_dict["d_range"] = tuple(data_dict["d_range"])
+        
+        data = DataConfig(**data_dict)
         model = ModelConfig(**d.get("model", {}))
         training = TrainingConfig(**d.get("training", {}))
         generator = GeneratorConfig(**d.get("generator", {}))
@@ -68,12 +58,7 @@ def config_from_dict(d: Dict[str, Any]) -> LacunaConfig:
 
 
 def save_config(config: LacunaConfig, path: Union[str, Path]) -> None:
-    """Save configuration to YAML file.
-    
-    Args:
-        config: LacunaConfig to save.
-        path: Output path.
-    """
+    """Save configuration to YAML file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -87,10 +72,10 @@ def config_to_dict(config: LacunaConfig) -> Dict[str, Any]:
     """Convert LacunaConfig to dictionary."""
     return {
         "data": {
-            "max_cols": config.data.max_cols,
             "n_range": list(config.data.n_range),
             "d_range": list(config.data.d_range),
-            "normalization": config.data.normalization,
+            "max_cols": config.data.max_cols,
+            "max_rows": config.data.max_rows,
         },
         "model": {
             "hidden_dim": config.model.hidden_dim,
@@ -100,17 +85,19 @@ def config_to_dict(config: LacunaConfig) -> Dict[str, Any]:
             "dropout": config.model.dropout,
         },
         "training": {
+            "epochs": config.training.epochs,
             "batch_size": config.training.batch_size,
+            "batches_per_epoch": config.training.batches_per_epoch,
+            "val_batches": config.training.val_batches,
             "lr": config.training.lr,
             "weight_decay": config.training.weight_decay,
-            "epochs": config.training.epochs,
+            "grad_clip": config.training.grad_clip,
             "warmup_steps": config.training.warmup_steps,
             "patience": config.training.patience,
-            "grad_clip": config.training.grad_clip,
+            "min_delta": config.training.min_delta,
         },
         "generator": {
             "n_generators": config.generator.n_generators,
-            "class_balance": list(config.generator.class_balance),
         },
         "seed": config.seed,
         "device": config.device,
