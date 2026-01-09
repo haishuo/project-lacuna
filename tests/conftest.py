@@ -44,3 +44,10 @@ def sample_observed_dataset(rng):
         feature_names=tuple(f"col_{i}" for i in range(d)),
         dataset_id="test_dataset",
     )
+
+
+@pytest.fixture
+def minimal_registry():
+    """Provide minimal 6-generator registry."""
+    from lacuna.generators import create_minimal_registry
+    return create_minimal_registry()
