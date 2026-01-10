@@ -47,6 +47,10 @@ from lacuna.core.exceptions import ValidationError
 # Token dimension: [value, is_observed, mask_type, feature_id_normalized]
 TOKEN_DIM = 4
 
+# Default limits for padding
+DEFAULT_MAX_ROWS = 128
+DEFAULT_MAX_COLS = 32
+
 # Indices into the token vector
 IDX_VALUE = 0
 IDX_OBSERVED = 1
@@ -136,12 +140,12 @@ def tokenize_dataset(
     max_rows: int,
     max_cols: int,
     artificial_mask: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Tokenize an entire dataset into a 3D token tensor.
     
     Args:
-        dataset: ObservedDataset containing X_obs (values) and R (mask).
+        dataset: ObservedDataset containing x (values) and r (mask).
         max_rows: Maximum number of rows (for padding/subsampling).
         max_cols: Maximum number of columns (for padding).
         artificial_mask: Optional [n, d] boolean array of artificially masked cells.
@@ -157,9 +161,19 @@ def tokenize_dataset(
         - If dataset has fewer rows than max_rows, output is zero-padded
         - Row and column masks indicate which positions contain real data
     """
-    X = dataset.X_obs  # [n, d] with NaN for missing
-    R = dataset.R      # [n, d] boolean mask
-    n, d = X.shape
+    # Extract numpy arrays from dataset (current API uses .x and .r)
+    # Handle both tensor and numpy array inputs
+    if hasattr(dataset.x, 'numpy'):
+        X = dataset.x.numpy()  # Convert torch tensor to numpy
+    else:
+        X = dataset.x
+    
+    if hasattr(dataset.r, 'numpy'):
+        R = dataset.r.numpy()  # Convert torch tensor to numpy
+    else:
+        R = dataset.r
+    
+    n, d = dataset.n, dataset.d
     
     # Handle row subsampling/padding
     if n > max_rows:
@@ -184,12 +198,21 @@ def tokenize_dataset(
     # Tokenize each row
     for i in range(n):
         row_artificial_mask = artificial_mask[i] if artificial_mask is not None else None
-        row_tokens, _ = tokenize_row(X[i], R[i], max_cols, row_artificial_mask)
+        
+        # For the current API, dataset.x has missing values zeroed out (not NaN)
+        # We need to reconstruct which values to pass to tokenize_row
+        row_values = X[i].copy().astype(np.float32)
+        row_mask_vals = R[i].astype(bool)
+        
+        # Set missing values to NaN for tokenize_row (it expects NaN for missing)
+        row_values[~row_mask_vals] = np.nan
+        
+        row_tokens, _ = tokenize_row(row_values, row_mask_vals, max_cols, row_artificial_mask)
         tokens[i] = row_tokens
         
         # Store original values for reconstruction targets
-        # Use the raw values (including NaN) - we'll handle NaN in loss computation
-        original_values[i, :d] = np.nan_to_num(X[i], nan=0.0)
+        # Use the values directly (already 0 where missing in current API)
+        original_values[i, :d] = X[i]
     
     return tokens, row_mask, col_mask, original_values
 
@@ -201,7 +224,6 @@ def tokenize_dataset(
 @dataclass
 class MaskingConfig:
     """Configuration for artificial masking during self-supervised pretraining."""
-    
     mask_ratio: float = 0.15        # Fraction of observed values to mask
     mask_observed_only: bool = True # Only mask cells that are observed
     min_masked: int = 1             # Minimum cells to mask per row
@@ -391,59 +413,63 @@ def get_token_dim() -> int:
 
 def extract_values(tokens: torch.Tensor) -> torch.Tensor:
     """
-    Extract normalized values from token tensor.
+    Extract value component from tokens.
     
     Args:
-        tokens: [*, TOKEN_DIM] token tensor
+        tokens: [..., TOKEN_DIM] token tensor
     
     Returns:
-        values: [*] tensor of normalized values
+        values: [...] value tensor
     """
     return tokens[..., IDX_VALUE]
 
 
 def extract_observed_mask(tokens: torch.Tensor) -> torch.Tensor:
     """
-    Extract observation mask from token tensor.
+    Extract observed indicator from tokens.
     
     Args:
-        tokens: [*, TOKEN_DIM] token tensor
+        tokens: [..., TOKEN_DIM] token tensor
     
     Returns:
-        mask: [*] tensor of observation indicators (1.0 = observed)
+        observed: [...] float tensor (1.0 = observed)
     """
     return tokens[..., IDX_OBSERVED]
 
 
 def extract_mask_type(tokens: torch.Tensor) -> torch.Tensor:
     """
-    Extract mask type indicators from token tensor.
+    Extract mask type from tokens.
     
     Args:
-        tokens: [*, TOKEN_DIM] token tensor
+        tokens: [..., TOKEN_DIM] token tensor
     
     Returns:
-        mask_type: [*] tensor (0.0 = natural, 1.0 = artificial)
+        mask_type: [...] float tensor (0.0 = natural, 1.0 = artificial)
     """
     return tokens[..., IDX_MASK_TYPE]
 
 
 def extract_feature_ids(tokens: torch.Tensor) -> torch.Tensor:
     """
-    Extract normalized feature IDs from token tensor.
+    Extract feature ID component from tokens.
     
     Args:
-        tokens: [*, TOKEN_DIM] token tensor
+        tokens: [..., TOKEN_DIM] token tensor
     
     Returns:
-        feature_ids: [*] tensor of normalized feature positions
+        feature_ids: [...] normalized feature ID tensor
     """
     return tokens[..., IDX_FEATURE_ID]
 
 
-def count_observed(tokens: torch.Tensor, row_mask: torch.Tensor, col_mask: torch.Tensor) -> torch.Tensor:
+def count_observed(
+    tokens: torch.Tensor,
+    row_mask: torch.Tensor,
+    col_mask: torch.Tensor,
+) -> torch.Tensor:
     """
-    Count observed values per sample in a batch.
+    Count observed values per sample.
     
     Args:
         tokens: [B, max_rows, max_cols, TOKEN_DIM] token tensor
@@ -451,25 +477,26 @@ def count_observed(tokens: torch.Tensor, row_mask: torch.Tensor, col_mask: torch
         col_mask: [B, max_cols] column validity mask
     
     Returns:
-        counts: [B] number of observed cells per sample
+        counts: [B] count per sample
     """
-    # Extract observation indicators
-    observed = extract_observed_mask(tokens)  # [B, max_rows, max_cols]
+    observed = extract_observed_mask(tokens)
     
-    # Create validity mask: only count cells in valid rows AND columns
-    # row_mask: [B, max_rows] -> [B, max_rows, 1]
-    # col_mask: [B, max_cols] -> [B, 1, max_cols]
-    validity = row_mask.unsqueeze(-1) & col_mask.unsqueeze(-2)  # [B, max_rows, max_cols]
+    # Create validity mask: [B, max_rows, max_cols]
+    validity = row_mask.unsqueeze(-1) & col_mask.unsqueeze(-2)
     
-    # Count observed cells within valid region
+    # Count observed values within valid cells
     counts = (observed * validity.float()).sum(dim=(1, 2))
     
     return counts
 
 
-def compute_missing_rate(tokens: torch.Tensor, row_mask: torch.Tensor, col_mask: torch.Tensor) -> torch.Tensor:
+def compute_missing_rate(
+    tokens: torch.Tensor,
+    row_mask: torch.Tensor,
+    col_mask: torch.Tensor,
+) -> torch.Tensor:
     """
-    Compute missing rate per sample in a batch.
+    Compute missing rate per sample.
     
     Args:
         tokens: [B, max_rows, max_cols, TOKEN_DIM] token tensor
