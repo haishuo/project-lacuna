@@ -1,61 +1,55 @@
 """
 lacuna.models.moe
 
-Mixture of Experts (MoE) layer for mechanism classification.
+Mixture of Experts layer for mechanism classification.
 
-Architecture Overview:
-    Instead of a simple classifier, Lacuna uses a gating network that routes
-    inputs to specialized expert heads. Each expert corresponds to a mechanism
-    class or MNAR variant.
-    
-    The gating network learns to recognize which "world" (mechanism) generated
-    the data, outputting mixture weights that become the mechanism posterior.
-
-Gating Granularities:
-    The MoE can operate at different levels depending on the analysis goal:
-    
-    1. Dataset-level gating (default):
-       - One mechanism dominates the entire dataset
-       - Gate takes dataset evidence vector, outputs [B, n_experts]
-       - Most common use case for mechanism classification
-    
-    2. Row-level gating:
-       - Mechanism mixture varies by subpopulation/row
-       - Gate takes row representations, outputs [B, max_rows, n_experts]
-       - Useful for detecting heterogeneous missingness patterns
-    
-    3. Feature-block gating (future):
-       - Different mechanisms for different variable groups
-       - Not yet implemented
+Architecture:
+    evidence [B, evidence_dim] + reconstruction_errors [B, n_heads]
+                            │
+                            ▼
+                    GatingNetwork (MLP)
+                            │
+                            ▼
+                gate_logits [B, n_experts]
+                            │
+                            ▼
+                softmax(logits / temperature)
+                            │
+                            ▼
+                gate_probs [B, n_experts]
+                            │
+                            ▼
+            get_class_posterior() with balanced aggregation
+                            │
+                            ▼
+                p_class [B, 3] (MCAR, MAR, MNAR)
 
 Expert Structure:
-    Experts are lightweight heads that refine the gating decision:
-    
-    - MCAR expert: Confirms random scatter pattern
-    - MAR expert: Confirms cross-column predictability
-    - MNAR experts (per variant): Confirm specific MNAR signatures
-    
-    The final output combines gating probabilities with expert outputs:
-        p(mechanism) = softmax(gate_logits + expert_adjustments)
-    
-    Or in "pure gating" mode:
-        p(mechanism) = softmax(gate_logits)
+    - Expert 0: MCAR
+    - Expert 1: MAR
+    - Experts 2+: MNAR variants (self_censoring, threshold, latent, ...)
 
-Integration with Reconstruction:
-    The reconstruction errors from each head can inform the gating:
-    
-    - Low MAR reconstruction error → increase MAR gate weight
-    - High MNAR reconstruction error → decrease MNAR gate weight
-    
-    This creates a feedback loop where reconstruction quality guides
-    mechanism classification.
+CRITICAL FIX (2026-01-10):
+--------------------------
+The original implementation summed expert probabilities to get class posteriors.
+With 1 MCAR expert, 1 MAR expert, and 3 MNAR experts, this creates a 3x prior
+toward MNAR (60% vs 20% vs 20% at initialization).
 
-Design Decisions:
-    1. Gating network is an MLP on the evidence/row representation
-    2. Experts are optional refinement heads (can be identity)
-    3. Reconstruction errors can be concatenated to gate input
-    4. Temperature scaling for calibrated probabilities
-    5. Load balancing loss to prevent expert collapse (optional)
+The fix: Use NORMALIZED aggregation that averages expert probabilities per class
+before re-normalizing. This gives equal prior weight to each class regardless
+of how many experts represent it.
+
+    Old (biased):     p_class[MNAR] = sum(p[experts 2,3,4]) = 60%
+    New (balanced):   p_class[MNAR] = mean(p[experts 2,3,4]) / Z = 33%
+
+Components:
+    MoEConfig: Configuration dataclass
+    GatingNetwork: MLP that produces expert logits from evidence
+    ExpertHead: Optional per-expert refinement head
+    ExpertHeads: Container for all expert heads
+    MixtureOfExperts: Main MoE layer
+    RowToDatasetAggregator: For row-level gating (experimental)
+    Load balancing loss to prevent expert collapse (optional)
 """
 
 import torch
@@ -101,6 +95,12 @@ class MoEConfig:
     temperature: float = 1.0       # Temperature for softmax calibration
     learn_temperature: bool = False  # Learn temperature as parameter
     
+    # Class aggregation method (NEW)
+    # "mean": Normalize by expert count per class (RECOMMENDED - removes structural bias)
+    # "sum": Original behavior (biased toward classes with more experts)
+    # "learned": Use learnable class-level bias correction
+    class_aggregation: str = "mean"
+    
     # Regularization
     load_balance_weight: float = 0.0  # Weight for load balancing loss (0 = disabled)
     entropy_weight: float = 0.0    # Weight for entropy regularization (0 = disabled)
@@ -111,6 +111,12 @@ class MoEConfig:
         
         if self.gating_level not in ("dataset", "row"):
             raise ValueError(f"gating_level must be 'dataset' or 'row', got {self.gating_level}")
+        
+        if self.class_aggregation not in ("mean", "sum", "learned"):
+            raise ValueError(
+                f"class_aggregation must be 'mean', 'sum', or 'learned', "
+                f"got {self.class_aggregation}"
+            )
     
     @property
     def n_experts(self) -> int:
@@ -364,6 +370,27 @@ class MixtureOfExperts(nn.Module):
             "expert_to_class",
             torch.tensor([MCAR, MAR] + [MNAR] * len(config.mnar_variants))
         )
+        
+        # Precompute experts per class for efficient aggregation
+        experts_per_class = torch.zeros(3)
+        for expert_idx in range(config.n_experts):
+            class_idx = self.expert_to_class[expert_idx].item()
+            experts_per_class[class_idx] += 1
+        self.register_buffer("experts_per_class", experts_per_class)
+        
+        # Learnable class bias (for "learned" aggregation mode)
+        if config.class_aggregation == "learned":
+            # Initialize to counteract the expert count imbalance
+            # With 1 MCAR, 1 MAR, N MNAR experts: bias MNAR by -log(N)
+            n_mnar = len(config.mnar_variants)
+            init_bias = torch.tensor([
+                0.0,                                              # MCAR (1 expert)
+                0.0,                                              # MAR (1 expert)
+                -torch.log(torch.tensor(float(n_mnar))).item(),   # MNAR (n_mnar experts)
+            ])
+            self.class_bias = nn.Parameter(init_bias)
+        else:
+            self.class_bias = None
     
     def forward(
         self,
@@ -421,7 +448,9 @@ class MixtureOfExperts(nn.Module):
         """
         Aggregate expert posteriors into mechanism class posterior.
         
-        Combines MNAR variant probabilities into single MNAR probability.
+        Uses the configured aggregation method to combine expert probabilities
+        into class-level probabilities. The default "mean" method normalizes
+        by expert count to remove structural bias.
         
         Args:
             moe_output: Output from forward().
@@ -429,18 +458,110 @@ class MixtureOfExperts(nn.Module):
         Returns:
             p_class: Class posterior [B, 3] for MCAR, MAR, MNAR.
         """
-        # gate_probs: [B, n_experts]
+        if self.config.class_aggregation == "sum":
+            return self._get_class_posterior_sum(moe_output)
+        elif self.config.class_aggregation == "mean":
+            return self._get_class_posterior_mean(moe_output)
+        elif self.config.class_aggregation == "learned":
+            return self._get_class_posterior_learned(moe_output)
+        else:
+            # Should never reach here due to config validation
+            raise ValueError(f"Unknown class_aggregation: {self.config.class_aggregation}")
+    
+    def _get_class_posterior_sum(
+        self,
+        moe_output: MoEOutput,
+    ) -> torch.Tensor:
+        """
+        Original (biased) aggregation: sum expert probs per class.
+        
+        WARNING: This creates a prior bias toward classes with more experts.
+        With 1 MCAR, 1 MAR, 3 MNAR experts, initial priors are ~20/20/60%.
+        
+        Kept for backward compatibility and ablation studies.
+        """
         probs = moe_output.gate_probs
         B = probs.shape[0]
         device = probs.device
         
-        # Sum probabilities by class
-        # expert_to_class maps each expert to its class (0=MCAR, 1=MAR, 2=MNAR)
         p_class = torch.zeros(B, 3, device=device)
         
         for expert_idx in range(self.config.n_experts):
             class_idx = self.expert_to_class[expert_idx].item()
             p_class[:, class_idx] += probs[:, expert_idx]
+        
+        return p_class
+    
+    def _get_class_posterior_mean(
+        self,
+        moe_output: MoEOutput,
+    ) -> torch.Tensor:
+        """
+        Balanced aggregation: average expert probs per class, then re-normalize.
+        
+        This removes the structural prior bias from having different numbers
+        of experts per class. Each class gets equal prior weight at initialization.
+        
+        Process:
+            1. Sum expert probs for each class
+            2. Divide by number of experts in that class (average)
+            3. Re-normalize so p_class sums to 1
+        
+        With 1 MCAR, 1 MAR, 3 MNAR experts and uniform 20% per expert:
+            - Sum:  MCAR=20%, MAR=20%, MNAR=60%
+            - Avg:  MCAR=20%, MAR=20%, MNAR=20%
+            - Norm: MCAR=33%, MAR=33%, MNAR=33%
+        """
+        probs = moe_output.gate_probs
+        B = probs.shape[0]
+        device = probs.device
+        
+        # Sum expert probs by class
+        p_class_sum = torch.zeros(B, 3, device=device)
+        for expert_idx in range(self.config.n_experts):
+            class_idx = self.expert_to_class[expert_idx].item()
+            p_class_sum[:, class_idx] += probs[:, expert_idx]
+        
+        # Average by number of experts per class
+        p_class_avg = p_class_sum / self.experts_per_class.unsqueeze(0).clamp(min=1.0)
+        
+        # Re-normalize to sum to 1
+        p_class = p_class_avg / p_class_avg.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        
+        return p_class
+    
+    def _get_class_posterior_learned(
+        self,
+        moe_output: MoEOutput,
+    ) -> torch.Tensor:
+        """
+        Learned aggregation: sum expert logits per class, add learned bias, softmax.
+        
+        Uses logsumexp for numerical stability when aggregating logits.
+        The learnable class_bias allows the model to learn the optimal
+        prior correction during training.
+        """
+        gate_logits = moe_output.combined_output
+        B = gate_logits.shape[0]
+        device = gate_logits.device
+        
+        # Aggregate logits by class using logsumexp
+        # logsumexp(a, b) = log(exp(a) + exp(b)) - equivalent to summing probs in log space
+        class_logits = torch.full((B, 3), float('-inf'), device=device)
+        
+        for expert_idx in range(self.config.n_experts):
+            class_idx = self.expert_to_class[expert_idx].item()
+            expert_logit = gate_logits[:, expert_idx:expert_idx+1]
+            class_logits[:, class_idx:class_idx+1] = torch.logaddexp(
+                class_logits[:, class_idx:class_idx+1],
+                expert_logit,
+            )
+        
+        # Add learned bias correction
+        corrected_logits = class_logits + self.class_bias.unsqueeze(0)
+        
+        # Softmax to get class posteriors
+        p_class = F.softmax(corrected_logits, dim=-1)
         
         return p_class
     
@@ -455,18 +576,17 @@ class MixtureOfExperts(nn.Module):
             moe_output: Output from forward().
         
         Returns:
-            p_variant: Variant posterior [B, n_mnar_variants].
-                      Normalized to sum to 1 (conditional on MNAR).
+            p_variant: Posterior over MNAR variants [B, n_variants].
+                      Sums to 1 (conditional distribution given MNAR).
         """
-        # gate_probs: [B, n_experts]
         probs = moe_output.gate_probs
         
-        # MNAR variants are experts 2, 3, 4, ...
-        mnar_probs = probs[:, 2:]  # [B, n_mnar_variants]
+        # MNAR experts start at index 2
+        mnar_probs = probs[:, 2:]  # [B, n_variants]
         
-        # Normalize to get conditional probabilities
-        mnar_sum = mnar_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        p_variant = mnar_probs / mnar_sum
+        # Normalize to get conditional distribution
+        mnar_total = mnar_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        p_variant = mnar_probs / mnar_total
         
         return p_variant
     
@@ -475,34 +595,35 @@ class MixtureOfExperts(nn.Module):
         moe_output: MoEOutput,
     ) -> torch.Tensor:
         """
-        Compute load balancing loss to prevent expert collapse.
+        Compute load balancing loss for MoE.
         
         Encourages uniform usage of experts across the batch.
+        From Switch Transformer: n_experts * sum(f_i * p_i)
+        where f_i = fraction of batch routed to expert i
+              p_i = average probability assigned to expert i
+        
+        Minimize this to encourage uniform expert usage.
         
         Args:
             moe_output: Output from forward().
         
         Returns:
-            loss: Load balancing loss (scalar).
+            loss: Load balance loss (scalar).
         """
-        # gate_probs: [B, n_experts]
-        probs = moe_output.gate_probs
+        probs = moe_output.gate_probs  # [B, n_experts]
+        n_experts = self.config.n_experts
         
-        # Average probability per expert across batch
+        # Average probability per expert
         avg_prob = probs.mean(dim=0)  # [n_experts]
         
-        # Fraction of batch where each expert has highest probability
-        hard_assignments = probs.argmax(dim=-1)  # [B]
-        expert_counts = torch.zeros(self.config.n_experts, device=probs.device)
-        for i in range(self.config.n_experts):
-            expert_counts[i] = (hard_assignments == i).float().sum()
-        expert_fractions = expert_counts / probs.shape[0]
+        # Fraction routed to each expert (hard assignment)
+        assignments = probs.argmax(dim=-1)  # [B]
+        fractions = torch.zeros(n_experts, device=probs.device)
+        for i in range(n_experts):
+            fractions[i] = (assignments == i).float().mean()
         
-        # Load balance loss: product of avg_prob and expert_fraction
-        # Minimizing this encourages uniform distribution
-        # See Switch Transformer paper for derivation
-        n_experts = self.config.n_experts
-        loss = n_experts * (avg_prob * expert_fractions).sum()
+        # Load balance loss
+        loss = n_experts * (avg_prob * fractions).sum()
         
         return loss
     
@@ -511,19 +632,18 @@ class MixtureOfExperts(nn.Module):
         moe_output: MoEOutput,
     ) -> torch.Tensor:
         """
-        Compute entropy regularization loss.
+        Compute entropy loss for regularization.
         
-        Encourages confident (low entropy) or uncertain (high entropy)
-        predictions depending on the sign of entropy_weight.
+        Returns negative entropy (so minimizing this maximizes entropy,
+        encouraging more uniform predictions when entropy_weight > 0).
         
         Args:
             moe_output: Output from forward().
         
         Returns:
-            loss: Negative entropy (scalar). Minimize to maximize entropy.
+            loss: Negative mean entropy (scalar).
         """
-        # gate_probs: [B, n_experts]
-        probs = moe_output.gate_probs
+        probs = moe_output.gate_probs  # [B, n_experts]
         
         # Entropy per sample
         log_probs = torch.log(probs.clamp(min=1e-8))
@@ -657,6 +777,7 @@ def create_moe(
     use_expert_heads: bool = False,
     temperature: float = 1.0,
     learn_temperature: bool = False,
+    class_aggregation: str = "mean",
     load_balance_weight: float = 0.0,
     entropy_weight: float = 0.0,
     dropout: float = 0.1,
@@ -676,6 +797,8 @@ def create_moe(
         use_expert_heads: Use expert refinement heads.
         temperature: Temperature for softmax calibration.
         learn_temperature: Learn temperature as parameter.
+        class_aggregation: Method for aggregating expert probs to class probs.
+                          "mean" (default, balanced), "sum" (biased), or "learned".
         load_balance_weight: Weight for load balancing loss.
         entropy_weight: Weight for entropy regularization.
         dropout: Dropout probability.
@@ -704,6 +827,7 @@ def create_moe(
         use_expert_heads=use_expert_heads,
         temperature=temperature,
         learn_temperature=learn_temperature,
+        class_aggregation=class_aggregation,
         load_balance_weight=load_balance_weight,
         entropy_weight=entropy_weight,
     )

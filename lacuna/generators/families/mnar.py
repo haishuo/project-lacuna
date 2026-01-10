@@ -10,6 +10,8 @@ fundamentally unidentifiable from observed data alone.
 Generators:
 - MNARLogistic: Missingness depends on target column value via logistic model
 - MNARSelfCensoring: Missingness depends on value in same column (self-censoring)
+
+CRITICAL: All generators implement apply_to(X, rng) for semi-synthetic data.
 """
 
 from typing import Tuple
@@ -21,10 +23,6 @@ from lacuna.generators.base import Generator
 from lacuna.generators.params import GeneratorParams
 from .base_data import sample_gaussian
 
-
-# =============================================================================
-# MNARLogistic
-# =============================================================================
 
 class MNARLogistic(Generator):
     """MNAR generator using logistic model with target dependence.
@@ -46,6 +44,8 @@ class MNARLogistic(Generator):
         beta1: Coefficient for predictor column (default 0.0)
         target_col_idx: Column index for missingness target (default -1, last column)
         predictor_col_idx: Column index for predictor (default 0, first column)
+        base_mean: Mean for Gaussian base data (default: 0.0)
+        base_std: Std for Gaussian base data (default: 1.0)
     """
     
     def __init__(
@@ -54,7 +54,6 @@ class MNARLogistic(Generator):
         name: str,
         params: GeneratorParams,
     ):
-        # Validate required parameters
         if "beta0" not in params:
             raise ValueError("MNARLogistic requires 'beta0' parameter")
         if "beta2" not in params:
@@ -74,67 +73,96 @@ class MNARLogistic(Generator):
             params=params,
         )
     
+    def _compute_missingness(
+        self,
+        X: torch.Tensor,
+        rng: RNGState,
+    ) -> torch.Tensor:
+        """Compute MNAR missingness mask based on data X.
+        
+        The key MNAR relationship: missingness depends on X_target (the value
+        that will be missing), not just on observed values.
+        
+        Args:
+            X: Complete data tensor [n, d]
+            rng: RNG state
+            
+        Returns:
+            R: Boolean mask [n, d], True = observed
+        """
+        n, d = X.shape
+        
+        if d < 2:
+            raise ValueError("MNARLogistic requires d >= 2")
+        
+        # Get column indices
+        target = self.params.get("target_col_idx", -1)
+        predictor = self.params.get("predictor_col_idx", 0)
+        
+        # Handle negative indices
+        if target < 0:
+            target = d + target
+        if predictor < 0:
+            predictor = d + predictor
+        
+        # Ensure valid and different
+        target = target % d
+        predictor = predictor % d
+        if predictor == target:
+            predictor = (target + 1) % d
+        
+        # Initialize all observed
+        R = torch.ones(n, d, dtype=torch.bool)
+        
+        # Get coefficients
+        beta0 = self.params["beta0"]
+        beta1 = self.params.get("beta1", 0.0)
+        beta2 = self.params["beta2"]
+        
+        # Compute missingness probability
+        # KEY MNAR: includes beta2 * X_target (the value that will be missing)
+        logits = beta0 + beta1 * X[:, predictor] + beta2 * X[:, target]
+        p_missing = torch.sigmoid(logits)
+        
+        missing_mask = rng.rand(n) < p_missing
+        R[:, target] = ~missing_mask
+        
+        # Ensure at least one observed
+        if R.sum() == 0:
+            R[0, 0] = True
+        
+        return R
+    
     def sample(
         self,
         rng: RNGState,
         n: int,
         d: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample complete data and missingness indicator.
+        """Sample synthetic data AND missingness."""
+        mean = self.params.get("base_mean", 0.0)
+        std = self.params.get("base_std", 1.0)
         
-        Args:
-            rng: RNG state for reproducibility.
-            n: Number of rows (observations).
-            d: Number of columns (features).
-        
-        Returns:
-            X_full: [n, d] complete data tensor.
-            R: [n, d] bool tensor, True = observed.
-        """
-        if d < 2:
-            raise ValueError(f"MNARLogistic requires d >= 2, got d={d}")
-        
-        # Generate complete data
-        X = sample_gaussian(rng, n, d)
-        
-        # Get parameters
-        beta0 = self.params["beta0"]
-        beta1 = self.params.get("beta1", 0.0)
-        beta2 = self.params["beta2"]
-        target_idx = self.params.get("target_col_idx", -1)
-        predictor_idx = self.params.get("predictor_col_idx", 0)
-        
-        # Handle negative indices
-        if target_idx < 0:
-            target_idx = d + target_idx
-        if predictor_idx < 0:
-            predictor_idx = d + predictor_idx
-        
-        # Compute logit for missingness
-        # MNAR signature: depends on X[:, target_idx] (the value that will be missing)
-        logit = beta0 + beta1 * X[:, predictor_idx] + beta2 * X[:, target_idx]
-        
-        # Convert to probability via sigmoid
-        p_missing = torch.sigmoid(logit)
-        
-        # Sample missingness
-        R = torch.ones(n, d, dtype=torch.bool)
-        missing = rng.rand(n) < p_missing
-        R[:, target_idx] = ~missing
-        
-        # Ensure at least one observation per column
-        if R[:, target_idx].sum() == 0:
-            R[0, target_idx] = True
+        X = sample_gaussian(rng.spawn(), n, d, mean=mean, std=std)
+        R = self._compute_missingness(X, rng.spawn())
         
         return X, R
+    
+    def apply_to(
+        self,
+        X: torch.Tensor,
+        rng: RNGState,
+    ) -> torch.Tensor:
+        """Apply MNAR missingness to existing data.
+        
+        For MNAR, missingness depends on the actual data values (including
+        the value that will be missing), so apply_to() uses the provided X.
+        """
+        return self._compute_missingness(X, rng)
 
-
-# =============================================================================
-# MNARSelfCensoring
-# =============================================================================
 
 class MNARSelfCensoring(Generator):
-    """MNAR generator with self-censoring mechanism.
+    """MNAR Self-Censoring generator.
     
     Each column's missingness depends on its own value. This is a 
     "pure MNAR" pattern where missingness is entirely driven by
@@ -154,6 +182,8 @@ class MNARSelfCensoring(Generator):
     
     Optional params:
         affected_frac: Fraction of columns with self-censoring (default 0.5)
+        base_mean: Mean for Gaussian base data (default: 0.0)
+        base_std: Std for Gaussian base data (default: 1.0)
     """
     
     def __init__(
@@ -162,7 +192,6 @@ class MNARSelfCensoring(Generator):
         name: str,
         params: GeneratorParams,
     ):
-        # Validate required parameters
         if "beta0" not in params:
             raise ValueError("MNARSelfCensoring requires 'beta0' parameter")
         if "beta1" not in params:
@@ -182,53 +211,70 @@ class MNARSelfCensoring(Generator):
             params=params,
         )
     
-    def sample(
+    def _compute_missingness(
         self,
+        X: torch.Tensor,
         rng: RNGState,
-        n: int,
-        d: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample complete data and missingness indicator.
+    ) -> torch.Tensor:
+        """Compute self-censoring MNAR missingness mask.
+        
+        For each affected column, missingness probability depends on
+        that column's own value.
         
         Args:
-            rng: RNG state for reproducibility.
-            n: Number of rows (observations).
-            d: Number of columns (features).
-        
+            X: Complete data tensor [n, d]
+            rng: RNG state
+            
         Returns:
-            X_full: [n, d] complete data tensor.
-            R: [n, d] bool tensor, True = observed.
+            R: Boolean mask [n, d], True = observed
         """
-        # Generate complete data
-        X = sample_gaussian(rng, n, d)
+        n, d = X.shape
         
-        # Get parameters
         beta0 = self.params["beta0"]
         beta1 = self.params["beta1"]
         affected_frac = self.params.get("affected_frac", 0.5)
         
         # Determine which columns are affected
         n_affected = max(1, int(d * affected_frac))
+        affected_cols = rng.choice(d, size=n_affected, replace=False)
         
-        # Use RNG to select affected columns (reproducibly)
-        col_probs = rng.rand(d)
-        affected_cols = torch.argsort(col_probs)[:n_affected]
-        
-        # Initialize R (all observed)
+        # Initialize all observed
         R = torch.ones(n, d, dtype=torch.bool)
         
         # Apply self-censoring to affected columns
-        for j in affected_cols:
-            # Self-censoring: missingness depends on own value
-            logit = beta0 + beta1 * X[:, j]
-            p_missing = torch.sigmoid(logit)
+        for col in affected_cols:
+            # Missingness depends on this column's own value
+            logits = beta0 + beta1 * X[:, col]
+            p_missing = torch.sigmoid(logits)
             
-            # Sample missingness
-            missing = rng.rand(n) < p_missing
-            R[:, j] = ~missing
-            
-            # Ensure at least one observation
-            if R[:, j].sum() == 0:
-                R[0, j] = True
+            missing_mask = rng.rand(n) < p_missing
+            R[:, col] = ~missing_mask
+        
+        # Ensure at least one observed
+        if R.sum() == 0:
+            R[0, 0] = True
+        
+        return R
+    
+    def sample(
+        self,
+        rng: RNGState,
+        n: int,
+        d: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample synthetic data AND missingness."""
+        mean = self.params.get("base_mean", 0.0)
+        std = self.params.get("base_std", 1.0)
+        
+        X = sample_gaussian(rng.spawn(), n, d, mean=mean, std=std)
+        R = self._compute_missingness(X, rng.spawn())
         
         return X, R
+    
+    def apply_to(
+        self,
+        X: torch.Tensor,
+        rng: RNGState,
+    ) -> torch.Tensor:
+        """Apply self-censoring MNAR missingness to existing data."""
+        return self._compute_missingness(X, rng)

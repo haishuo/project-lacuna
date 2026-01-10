@@ -22,6 +22,15 @@ masked cells). This is the key to MAR/MNAR discrimination:
 
 The error PATTERN across heads is the discriminative signal.
 
+CRITICAL FIX (2026-01-10) - CLASS AGGREGATION:
+----------------------------------------------
+The original MoE had 1 MCAR expert, 1 MAR expert, and 3 MNAR experts. When
+summing expert probabilities to get class probabilities, this created a 3x
+structural prior toward MNAR (60% vs 20% vs 20% at initialization).
+
+The fix: Use "mean" aggregation (default) which averages expert probabilities
+per class before re-normalizing, giving equal prior weight to each class.
+
 Architecture Overview:
 
     Input: TokenBatch
@@ -46,6 +55,7 @@ Architecture Overview:
     ┌─────────────────────────────────────────────────────────────────┐
     │                      MixtureOfExperts                           │
     │  evidence + natural_errors → GatingNetwork → posterior          │
+    │  get_class_posterior() uses BALANCED aggregation                │
     └─────────────────────────────────────────────────────────────────┘
         │
         │ p_class [B, 3], p_mechanism [B, n_experts]
@@ -140,6 +150,14 @@ class LacunaModelConfig:
     learn_temperature: bool = False   # Learn temperature
     load_balance_weight: float = 0.0  # MoE load balancing loss weight
     
+    # === Class Aggregation (CRITICAL FIX) ===
+    # Method for aggregating expert probabilities to class probabilities
+    # "mean": Balanced - normalizes by expert count per class (RECOMMENDED)
+    #         Gives equal prior to each class regardless of expert count
+    # "sum": Original biased behavior - classes with more experts get higher prior
+    # "learned": Learnable bias correction
+    class_aggregation: str = "mean"
+    
     # === Decision ===
     # Loss matrix for Bayes-optimal decision rule
     # Rows: actions (Green, Yellow, Red)
@@ -165,6 +183,13 @@ class LacunaModelConfig:
                 1.0, 1.0,  2.0,  # Yellow
                 3.0, 2.0,  0.0,  # Red
             ]
+        
+        # Validate class_aggregation
+        if self.class_aggregation not in ("mean", "sum", "learned"):
+            raise ValueError(
+                f"class_aggregation must be 'mean', 'sum', or 'learned', "
+                f"got {self.class_aggregation}"
+            )
     
     @property
     def n_experts(self) -> int:
@@ -214,6 +239,7 @@ class LacunaModelConfig:
             use_expert_heads=self.use_expert_heads,
             temperature=self.temperature,
             learn_temperature=self.learn_temperature,
+            class_aggregation=self.class_aggregation,  # Pass through to MoE
             load_balance_weight=self.load_balance_weight,
         )
 
@@ -246,17 +272,17 @@ class BayesOptimalDecision(nn.Module):
     def __init__(
         self,
         loss_matrix: torch.Tensor,
-        action_names: Tuple[str, ...] = ("Green", "Yellow", "Red"),
+        action_names: Tuple[str, str, str] = ("Green", "Yellow", "Red"),
     ):
         super().__init__()
         
-        # loss_matrix: [n_actions, n_classes]
         self.register_buffer("loss_matrix", loss_matrix)
         self.action_names = action_names
-        self.n_actions = loss_matrix.shape[0]
-        self.n_classes = loss_matrix.shape[1]
     
-    def forward(self, p_class: torch.Tensor) -> Decision:
+    def forward(
+        self,
+        p_class: torch.Tensor,
+    ) -> Decision:
         """
         Compute Bayes-optimal decision.
         
@@ -264,37 +290,17 @@ class BayesOptimalDecision(nn.Module):
             p_class: Class posterior. Shape: [B, n_classes]
         
         Returns:
-            Decision with action_ids and expected_risks.
+            decision: Decision object with action_ids, expected_risks, confidence.
         """
-        # Compute expected risk for each action
-        # p_class: [B, n_classes]
-        # loss_matrix: [n_actions, n_classes]
-        # expected_risk[b, a] = sum_s p_class[b, s] * loss_matrix[a, s]
-        expected_risks = torch.matmul(p_class, self.loss_matrix.T)  # [B, n_actions]
-        
-        # Select action with minimum expected risk
-        action_ids = expected_risks.argmin(dim=-1)  # [B]
-        min_risks = expected_risks.gather(1, action_ids.unsqueeze(-1)).squeeze(-1)  # [B]
-        
-        # Compute confidence as 1 - (risk ratio)
-        # Lower min_risk relative to max_risk = higher confidence
-        max_risks = expected_risks.max(dim=-1).values
-        risk_range = (max_risks - min_risks).clamp(min=1e-8)
-        confidence = risk_range / max_risks.clamp(min=1e-8)
-        
-        return Decision(
-            action_ids=action_ids,
-            action_names=self.action_names,
-            expected_risks=min_risks,
-            confidence=confidence,
-        )
+        decision, _ = self.forward_with_risks(p_class)
+        return decision
     
-    def forward_with_all_risks(
+    def forward_with_risks(
         self,
         p_class: torch.Tensor,
     ) -> Tuple[Decision, torch.Tensor]:
         """
-        Compute decision and return all expected risks.
+        Compute Bayes-optimal decision with all expected risks.
         
         Args:
             p_class: Class posterior. Shape: [B, n_classes]
@@ -303,10 +309,15 @@ class BayesOptimalDecision(nn.Module):
             decision: Decision object.
             all_risks: Expected risks for all actions. Shape: [B, n_actions]
         """
+        # Compute expected risk for each action
+        # expected_risks[b, a] = sum_s p_class[b, s] * loss_matrix[a, s]
         expected_risks = torch.matmul(p_class, self.loss_matrix.T)
+        
+        # Select action with minimum expected risk
         action_ids = expected_risks.argmin(dim=-1)
         min_risks = expected_risks.gather(1, action_ids.unsqueeze(-1)).squeeze(-1)
         
+        # Compute confidence as normalized risk range
         max_risks = expected_risks.max(dim=-1).values
         risk_range = (max_risks - min_risks).clamp(min=1e-8)
         confidence = risk_range / max_risks.clamp(min=1e-8)
@@ -363,6 +374,9 @@ class LacunaModel(nn.Module):
     
     CRITICAL: The MoE receives NATURAL reconstruction errors (errors on
     naturally missing cells) as the discriminative signal for MAR vs MNAR.
+    
+    CRITICAL: The MoE uses BALANCED class aggregation (default "mean") to
+    avoid structural prior bias toward MNAR from having more MNAR experts.
     
     Attributes:
         config: LacunaModelConfig with all architecture parameters.
@@ -492,6 +506,7 @@ class LacunaModel(nn.Module):
         
         # === 4. Build PosteriorResult ===
         # Get class posterior (aggregates MNAR variants)
+        # Uses BALANCED aggregation by default to avoid MNAR prior bias
         p_class = self.moe.get_class_posterior(moe_output)
         
         # Get MNAR variant posterior (conditional on MNAR)
@@ -697,6 +712,7 @@ def create_lacuna_model(
     temperature: float = 1.0,
     learn_temperature: bool = False,
     load_balance_weight: float = 0.0,
+    class_aggregation: str = "mean",
     # Decision
     loss_matrix: Optional[List[float]] = None,
     # Regularization
@@ -724,6 +740,8 @@ def create_lacuna_model(
         temperature: Softmax temperature for calibration.
         learn_temperature: Learn temperature as parameter.
         load_balance_weight: MoE load balancing loss weight.
+        class_aggregation: Method for aggregating expert probs to class probs.
+                          "mean" (default, balanced), "sum" (biased), or "learned".
         loss_matrix: Bayes decision loss matrix (flat list, row-major).
         dropout: Dropout probability.
     
@@ -756,6 +774,7 @@ def create_lacuna_model(
         temperature=temperature,
         learn_temperature=learn_temperature,
         load_balance_weight=load_balance_weight,
+        class_aggregation=class_aggregation,
         loss_matrix=loss_matrix,
         dropout=dropout,
     )
@@ -801,6 +820,7 @@ def create_lacuna_mini(
         gate_n_layers=1,
         use_reconstruction_errors=True,
         use_expert_heads=False,
+        class_aggregation="mean",
         dropout=0.1,
     )
 
@@ -841,6 +861,7 @@ def create_lacuna_base(
         use_expert_heads=False,
         temperature=1.0,
         learn_temperature=False,
+        class_aggregation="mean",
         dropout=0.1,
     )
 
@@ -882,5 +903,6 @@ def create_lacuna_large(
         temperature=1.0,
         learn_temperature=True,
         load_balance_weight=0.01,
+        class_aggregation="mean",
         dropout=0.1,
     )

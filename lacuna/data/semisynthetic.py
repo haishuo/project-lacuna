@@ -6,10 +6,30 @@ Semi-synthetic data generation: real data + synthetic missingness.
 This module provides utilities for applying synthetic missingness mechanisms
 to complete real-world datasets, creating semi-synthetic training data with
 known ground-truth mechanism labels.
+
+CRITICAL FIX (2026-01-10):
+--------------------------
+The original implementation called generator.sample(rng, n, d) which generates
+BOTH synthetic X and missingness R based on that synthetic X. We then threw
+away the synthetic X and applied R to real X. This broke MAR mechanisms because:
+
+    MAR: Missingness in target depends on value in predictor column
+    
+    Old (broken): R computed from synthetic_X[:, predictor], applied to real_X
+                  -> No actual MAR relationship in the data model sees!
+    
+    New (fixed):  R computed from real_X[:, predictor]
+                  -> True MAR relationship preserved
+
+The fix: Add generator.apply_to(X, rng) method that computes missingness
+based on the PROVIDED data X, not internally generated synthetic data.
+For generators that don't support this, fall back to the old behavior
+with a warning.
 """
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+import warnings
 import torch
 
 from lacuna.core.types import ObservedDataset
@@ -43,6 +63,9 @@ def apply_missingness(
 ) -> SemiSyntheticDataset:
     """Apply a missingness mechanism to complete data.
     
+    CRITICAL FIX: For MAR/MNAR mechanisms to work correctly, we must compute
+    missingness based on the ACTUAL data values, not synthetic data.
+    
     Args:
         raw: Complete dataset (no missing values).
         generator: Missingness generator to apply.
@@ -57,10 +80,22 @@ def apply_missingness(
     # Get the complete data as tensor
     X_complete = torch.from_numpy(raw.data.astype('float32'))
     
-    # Sample missingness pattern using generator
-    # Generator.sample() returns (X_generated, R)
-    # We only use R and apply it to our real X
-    _, R = generator.sample(rng, n, d)
+    # CRITICAL FIX: Use apply_to() if available, which computes missingness
+    # based on the provided X, not internally generated synthetic data.
+    # This is essential for MAR/MNAR where missingness depends on data values.
+    if hasattr(generator, 'apply_to'):
+        R = generator.apply_to(X_complete, rng)
+    else:
+        # Fallback to old behavior with warning
+        # The generator.sample() returns (synthetic_X, R) where R was computed
+        # based on synthetic_X. This breaks MAR/MNAR for semi-synthetic data.
+        warnings.warn(
+            f"Generator '{generator.name}' does not support apply_to(). "
+            f"Using sample() which may not preserve MAR/MNAR relationships "
+            f"in semi-synthetic data. Consider implementing apply_to().",
+            UserWarning
+        )
+        _, R = generator.sample(rng, n, d)
     
     # Ensure at least one observed value per column (prevents degenerate cases)
     for col in range(d):
@@ -254,7 +289,7 @@ class SemiSyntheticDataLoader:
                 gen_id = self.prior.sample(batch_rng.spawn())
                 generator = self.registry[gen_id]
                 
-                # Apply missingness
+                # Apply missingness (using fixed apply_missingness)
                 ss = apply_missingness(
                     raw=raw,
                     generator=generator,
@@ -313,12 +348,9 @@ class MixedDataLoader:
         self.semisynthetic_loader = semisynthetic_loader
         self.mix_ratio = mix_ratio
         self.seed = seed
-        
-        # Total batches = sum of both
-        self._total_batches = len(synthetic_loader) + len(semisynthetic_loader)
     
     def __len__(self) -> int:
-        return self._total_batches
+        return len(self.synthetic_loader)
     
     def __iter__(self):
         rng = RNGState(seed=self.seed)
@@ -326,22 +358,16 @@ class MixedDataLoader:
         syn_iter = iter(self.synthetic_loader)
         semi_iter = iter(self.semisynthetic_loader)
         
-        syn_remaining = len(self.synthetic_loader)
-        semi_remaining = len(self.semisynthetic_loader)
-        
-        while syn_remaining > 0 or semi_remaining > 0:
-            # Decide which loader to draw from
-            if semi_remaining == 0:
-                yield next(syn_iter)
-                syn_remaining -= 1
-            elif syn_remaining == 0:
-                yield next(semi_iter)
-                semi_remaining -= 1
-            else:
-                # Random choice based on mix_ratio
-                if rng.rand(1).item() < self.mix_ratio:
+        for _ in range(len(self)):
+            if rng.rand(1).item() < self.mix_ratio:
+                try:
                     yield next(semi_iter)
-                    semi_remaining -= 1
-                else:
+                except StopIteration:
+                    semi_iter = iter(self.semisynthetic_loader)
+                    yield next(semi_iter)
+            else:
+                try:
                     yield next(syn_iter)
-                    syn_remaining -= 1
+                except StopIteration:
+                    syn_iter = iter(self.synthetic_loader)
+                    yield next(syn_iter)
