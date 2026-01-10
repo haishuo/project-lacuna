@@ -279,7 +279,6 @@ class SemiSyntheticDataLoader:
                 max_cols=self.max_cols,
                 generator_ids=generator_ids,
                 class_mapping=self._class_mapping,
-                row_sample_seed=batch_rng.seed,
             )
             
             yield batch

@@ -332,18 +332,20 @@ class TestMixedDataLoader:
         """Should iterate through both loaders."""
         prior = GeneratorPrior.uniform(minimal_registry)
         
-        from lacuna.data.batching import SyntheticDataLoader
+        from lacuna.data.batching import SyntheticDataLoader, SyntheticDataLoaderConfig
         
-        syn_loader = SyntheticDataLoader(
-            registry=minimal_registry,
-            prior=prior,
+        syn_config = SyntheticDataLoaderConfig(
+            batch_size=4,
             n_range=(30, 50),
             d_range=(3, 5),
             max_rows=64,
             max_cols=16,
-            batch_size=4,
             batches_per_epoch=3,
             seed=42,
+        )
+        syn_loader = SyntheticDataLoader(
+            generators=list(minimal_registry.generators),
+            config=syn_config,
         )
         
         semi_loader = SemiSyntheticDataLoader(
