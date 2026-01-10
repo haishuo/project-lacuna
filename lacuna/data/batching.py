@@ -136,7 +136,7 @@ class SyntheticDataLoader:
     
     def __init__(
         self,
-        generators: List,  # List of BaseGenerator
+        generators: List,  # List of Generator
         config: SyntheticDataLoaderConfig,
         class_mapping: Optional[Dict[int, int]] = None,
     ):
@@ -235,20 +235,39 @@ class SyntheticDataLoader:
             
             # Apply artificial masking for self-supervised learning
             if self.config.apply_masking:
-                X_masked, R_masked, art_mask = apply_artificial_masking(
-                    dataset.X_obs,
-                    dataset.R,
+                # Convert tensors to numpy for apply_artificial_masking
+                # The function expects numpy arrays with NaN for missing values
+                x_np = dataset.x.numpy() if hasattr(dataset.x, 'numpy') else dataset.x
+                r_np = dataset.r.numpy() if hasattr(dataset.r, 'numpy') else dataset.r
+                
+                # apply_artificial_masking expects NaN for missing values
+                # but current ObservedDataset uses 0 for missing, so convert
+                x_with_nan = x_np.copy()
+                x_with_nan[~r_np] = np.nan
+                
+                x_masked_np, r_masked_np, art_mask = apply_artificial_masking(
+                    x_with_nan,
+                    r_np,
                     self.masking_config,
                     rng=self.rng.numpy_rng,
                 )
                 
-                # Create new dataset with masked values
+                # Convert back: replace NaN with 0 for ObservedDataset convention
+                x_masked_np = np.nan_to_num(x_masked_np, nan=0.0)
+                
+                # Convert back to tensors for new ObservedDataset
+                x_masked = torch.from_numpy(x_masked_np.astype(np.float32))
+                r_masked = torch.from_numpy(r_masked_np.astype(bool))
+                
+                # Create new dataset with masked values using current API
                 dataset = ObservedDataset(
-                    X_obs=X_masked,
-                    R=R_masked,
+                    x=x_masked,
+                    r=r_masked,
+                    n=dataset.n,
+                    d=dataset.d,
+                    feature_names=dataset.feature_names,
                     dataset_id=dataset.dataset_id,
-                    n_original=dataset.n_original,
-                    d_original=dataset.d_original,
+                    meta=dataset.meta,
                 )
                 artificial_masks.append(art_mask)
             else:
