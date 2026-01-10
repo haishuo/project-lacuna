@@ -1,178 +1,505 @@
 """
 lacuna.data.batching
 
-Batch construction for row-level tokenization.
+Data loaders for synthetic and semi-synthetic training.
+
+Provides:
+    - SyntheticDataLoader: Generates infinite stream of synthetic data
+    - collate_fn: Collate function for PyTorch DataLoader
+    - Utilities for batch generation with artificial masking
 
 Design:
-- Each dataset becomes [n, d, TOKEN_DIM] tokens
-- Batching pads both rows (n) and columns (d)
-- Row sampling for large datasets
+    - Generators produce ObservedDataset with known mechanism
+    - Tokenization converts to TokenBatch for model input
+    - Artificial masking enables self-supervised pretraining
 """
 
 import torch
-from typing import List, Optional, Tuple
+import numpy as np
+from typing import Optional, List, Dict, Iterator, Tuple, Union
+from dataclasses import dataclass
 
 from lacuna.core.types import ObservedDataset, TokenBatch
 from lacuna.core.rng import RNGState
-from .tokenization import tokenize_dataset, TOKEN_DIM
+from lacuna.data.tokenization import (
+    tokenize_and_batch,
+    apply_artificial_masking,
+    MaskingConfig,
+    TOKEN_DIM,
+)
 
 
-def tokenize_and_batch(
-    datasets: List[ObservedDataset],
-    max_rows: int,
-    max_cols: int,
-    generator_ids: Optional[List[int]] = None,
-    class_mapping: Optional[torch.Tensor] = None,
-    row_sample_seed: Optional[int] = None,
-) -> TokenBatch:
-    """Tokenize and batch multiple datasets.
+# =============================================================================
+# Collate Function
+# =============================================================================
+
+def collate_fn(batches: List[TokenBatch]) -> TokenBatch:
+    """
+    Collate multiple TokenBatch objects into a single batch.
+    
+    For use with PyTorch DataLoader when datasets are pre-tokenized.
     
     Args:
-        datasets: List of ObservedDataset objects.
-        max_rows: Maximum rows per dataset (sample if larger).
-        max_cols: Maximum columns (pad/truncate).
-        generator_ids: Optional generator labels.
-        class_mapping: [K] tensor mapping generator_id -> class_id.
-        row_sample_seed: Seed for row sampling (for reproducibility).
+        batches: List of TokenBatch objects (typically batch_size=1 each).
     
     Returns:
-        TokenBatch with shape [B, max_rows, max_cols, TOKEN_DIM].
+        Combined TokenBatch with all samples.
+    
+    Example:
+        >>> loader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
     """
-    B = len(datasets)
+    # Stack all tensors along batch dimension
+    tokens = torch.cat([b.tokens for b in batches], dim=0)
+    row_mask = torch.cat([b.row_mask for b in batches], dim=0)
+    col_mask = torch.cat([b.col_mask for b in batches], dim=0)
     
-    # Initialize padded tensors
-    tokens = torch.zeros(B, max_rows, max_cols, TOKEN_DIM)
-    row_mask = torch.zeros(B, max_rows, dtype=torch.bool)
-    col_mask = torch.zeros(B, max_cols, dtype=torch.bool)
-    
-    rng = RNGState(seed=row_sample_seed) if row_sample_seed else None
-    
-    for i, ds in enumerate(datasets):
-        # Tokenize dataset
-        ds_tokens = tokenize_dataset(ds, normalize=True)  # [n, d, TOKEN_DIM]
-        n, d = ds.n, ds.d
-        
-        # Sample rows if too many
-        if n > max_rows:
-            if rng:
-                indices = rng.choice(n, size=max_rows, replace=False)
-                indices = torch.from_numpy(indices).sort()[0]
-            else:
-                indices = torch.arange(max_rows)
-            ds_tokens = ds_tokens[indices]
-            n = max_rows
-        
-        # Truncate columns if needed
-        d_use = min(d, max_cols)
-        
-        # Fill in batch tensors
-        tokens[i, :n, :d_use, :] = ds_tokens[:n, :d_use, :]
-        row_mask[i, :n] = True
-        col_mask[i, :d_use] = True
-    
-    # Process labels
+    # Handle optional tensors
     gen_ids = None
-    cls_ids = None
+    if all(b.generator_ids is not None for b in batches):
+        gen_ids = torch.cat([b.generator_ids for b in batches], dim=0)
     
-    if generator_ids is not None:
-        gen_ids = torch.tensor(generator_ids, dtype=torch.long)
-        
-        if class_mapping is not None:
-            cls_ids = class_mapping[gen_ids]
+    class_ids = None
+    if all(b.class_ids is not None for b in batches):
+        class_ids = torch.cat([b.class_ids for b in batches], dim=0)
+    
+    variant_ids = None
+    if all(b.variant_ids is not None for b in batches):
+        variant_ids = torch.cat([b.variant_ids for b in batches], dim=0)
+    
+    original_values = None
+    if all(b.original_values is not None for b in batches):
+        original_values = torch.cat([b.original_values for b in batches], dim=0)
+    
+    reconstruction_mask = None
+    if all(b.reconstruction_mask is not None for b in batches):
+        reconstruction_mask = torch.cat([b.reconstruction_mask for b in batches], dim=0)
     
     return TokenBatch(
         tokens=tokens,
         row_mask=row_mask,
         col_mask=col_mask,
         generator_ids=gen_ids,
-        class_ids=cls_ids,
+        class_ids=class_ids,
+        variant_ids=variant_ids,
+        original_values=original_values,
+        reconstruction_mask=reconstruction_mask,
     )
 
 
+# =============================================================================
+# Synthetic Data Loader
+# =============================================================================
+
+@dataclass
+class SyntheticDataLoaderConfig:
+    """Configuration for SyntheticDataLoader."""
+    
+    # Batch settings
+    batch_size: int = 32
+    
+    # Dataset dimensions
+    n_range: Tuple[int, int] = (50, 500)   # Row range (min, max)
+    d_range: Tuple[int, int] = (5, 20)     # Column range (min, max)
+    max_rows: int = 256                     # Max rows for tokenization
+    max_cols: int = 32                      # Max cols for tokenization
+    
+    # Artificial masking for self-supervised
+    apply_masking: bool = True
+    mask_ratio: float = 0.15
+    
+    # Iteration
+    batches_per_epoch: Optional[int] = None  # None = infinite
+    
+    # Reproducibility
+    seed: Optional[int] = None
+
+
 class SyntheticDataLoader:
-    """Data loader that generates synthetic data on-the-fly."""
+    """
+    Data loader that generates synthetic data on-the-fly.
+    
+    Samples from registered generators to produce infinite streams
+    of labeled (X, R, mechanism) training data.
+    
+    Attributes:
+        generators: List of generators to sample from.
+        config: SyntheticDataLoaderConfig with settings.
+        rng: RNG state for reproducibility.
+    
+    Example:
+        >>> from lacuna.generators import create_default_registry
+        >>> registry = create_default_registry()
+        >>> loader = SyntheticDataLoader(registry.generators, config)
+        >>> for batch in loader:
+        ...     output = model(batch)
+    """
     
     def __init__(
         self,
-        registry,  # GeneratorRegistry
-        prior,     # GeneratorPrior
-        n_range: Tuple[int, int],
-        d_range: Tuple[int, int],
-        max_rows: int,
-        max_cols: int,
-        batch_size: int,
-        batches_per_epoch: int,
-        seed: int = 42,
+        generators: List,  # List of BaseGenerator
+        config: SyntheticDataLoaderConfig,
+        class_mapping: Optional[Dict[int, int]] = None,
     ):
-        self.registry = registry
-        self.prior = prior
-        self.n_range = n_range
-        self.d_range = d_range
-        self.max_rows = max_rows
-        self.max_cols = max_cols
-        self.batch_size = batch_size
-        self.batches_per_epoch = batches_per_epoch
-        self.seed = seed
+        """
+        Initialize synthetic data loader.
         
-        self._class_mapping = registry.get_class_mapping()
+        Args:
+            generators: List of generator instances.
+            config: Loader configuration.
+            class_mapping: Optional mapping from generator_id to class_id.
+        """
+        self.generators = generators
+        self.config = config
+        
+        # Build class mapping if not provided
+        if class_mapping is None:
+            self.class_mapping = {g.generator_id: g.class_id for g in generators}
+        else:
+            self.class_mapping = class_mapping
+        
+        # Build variant mapping (for MNAR generators)
+        self.variant_mapping = {}
+        for g in generators:
+            if hasattr(g, 'variant_id'):
+                self.variant_mapping[g.generator_id] = g.variant_id
+            else:
+                self.variant_mapping[g.generator_id] = -1  # No variant
+        
+        # Initialize RNG
+        seed = config.seed if config.seed is not None else 42
+        self.rng = RNGState(seed=seed)
+        
+        # Masking config
+        self.masking_config = MaskingConfig(
+            mask_ratio=config.mask_ratio,
+            mask_observed_only=True,
+            min_masked=1,
+        )
+        
+        # Track iteration
+        self._batch_count = 0
+    
+    def __iter__(self) -> Iterator[TokenBatch]:
+        """Iterate over batches."""
+        self._batch_count = 0
+        return self
+    
+    def __next__(self) -> TokenBatch:
+        """Generate next batch."""
+        # Check epoch limit
+        if (
+            self.config.batches_per_epoch is not None
+            and self._batch_count >= self.config.batches_per_epoch
+        ):
+            raise StopIteration
+        
+        batch = self._generate_batch()
+        self._batch_count += 1
+        return batch
     
     def __len__(self) -> int:
-        return self.batches_per_epoch
+        """Return batches per epoch (or large number if infinite)."""
+        if self.config.batches_per_epoch is not None:
+            return self.config.batches_per_epoch
+        return 10000  # Arbitrary large number for infinite loader
     
-    def __iter__(self):
-        rng = RNGState(seed=self.seed)
+    def _generate_batch(self) -> TokenBatch:
+        """Generate a single batch of synthetic data."""
+        datasets = []
+        generator_ids = []
+        variant_ids = []
+        artificial_masks = []
         
-        for batch_idx in range(self.batches_per_epoch):
-            batch_rng = rng.spawn()
+        for _ in range(self.config.batch_size):
+            # Randomly select generator
+            gen_idx = self.rng.numpy_rng.integers(0, len(self.generators))
+            generator = self.generators[gen_idx]
             
-            # Sample generator IDs
-            gen_ids = self.prior.sample_batch(batch_rng.spawn(), self.batch_size)
-            
-            # Generate datasets
-            datasets = []
-            for i in range(self.batch_size):
-                gen_id = gen_ids[i].item()
-                generator = self.registry[gen_id]
-                
-                # Random n and d
-                n = batch_rng.randint(self.n_range[0], self.n_range[1] + 1, (1,)).item()
-                d = batch_rng.randint(self.d_range[0], self.d_range[1] + 1, (1,)).item()
-                
-                ds = generator.sample_observed(
-                    rng=batch_rng.spawn(),
-                    n=n,
-                    d=d,
-                    dataset_id=f"batch{batch_idx}_item{i}",
-                )
-                datasets.append(ds)
-            
-            # Tokenize and batch
-            batch = tokenize_and_batch(
-                datasets=datasets,
-                max_rows=self.max_rows,
-                max_cols=self.max_cols,
-                generator_ids=gen_ids.tolist(),
-                class_mapping=self._class_mapping,
-                row_sample_seed=batch_rng.seed,
+            # Random dataset dimensions
+            n = self.rng.numpy_rng.integers(
+                self.config.n_range[0],
+                self.config.n_range[1] + 1
+            )
+            d = self.rng.numpy_rng.integers(
+                self.config.d_range[0],
+                min(self.config.d_range[1] + 1, self.config.max_cols + 1)
             )
             
-            yield batch
-
-
-def collate_fn(
-    batch: List[Tuple[ObservedDataset, int]],
-    max_rows: int,
-    max_cols: int,
-    class_mapping: Optional[torch.Tensor] = None,
-) -> TokenBatch:
-    """Collate function for DataLoader."""
-    datasets = [item[0] for item in batch]
-    generator_ids = [item[1] for item in batch]
+            # Generate dataset
+            dataset = generator.sample_observed(
+                rng=self.rng.spawn(),
+                n=n,
+                d=d,
+                dataset_id=f"syn_{self._batch_count}_{len(datasets)}",
+            )
+            
+            # Apply artificial masking for self-supervised learning
+            if self.config.apply_masking:
+                X_masked, R_masked, art_mask = apply_artificial_masking(
+                    dataset.X_obs,
+                    dataset.R,
+                    self.masking_config,
+                    rng=self.rng.numpy_rng,
+                )
+                
+                # Create new dataset with masked values
+                dataset = ObservedDataset(
+                    X_obs=X_masked,
+                    R=R_masked,
+                    dataset_id=dataset.dataset_id,
+                    n_original=dataset.n_original,
+                    d_original=dataset.d_original,
+                )
+                artificial_masks.append(art_mask)
+            else:
+                artificial_masks.append(None)
+            
+            datasets.append(dataset)
+            generator_ids.append(generator.generator_id)
+            variant_ids.append(self.variant_mapping.get(generator.generator_id, -1))
+        
+        # Tokenize and batch
+        batch = tokenize_and_batch(
+            datasets=datasets,
+            max_rows=self.config.max_rows,
+            max_cols=self.config.max_cols,
+            generator_ids=generator_ids,
+            class_mapping=self.class_mapping,
+            variant_ids=variant_ids,
+            artificial_masks=artificial_masks if self.config.apply_masking else None,
+        )
+        
+        return batch
     
-    return tokenize_and_batch(
-        datasets=datasets,
+    def reset(self, seed: Optional[int] = None):
+        """
+        Reset the data loader.
+        
+        Args:
+            seed: Optional new seed for RNG.
+        """
+        if seed is not None:
+            self.rng = RNGState(seed=seed)
+        self._batch_count = 0
+
+
+# =============================================================================
+# Validation Data Loader
+# =============================================================================
+
+class ValidationDataLoader:
+    """
+    Data loader for validation with fixed data.
+    
+    Unlike SyntheticDataLoader, this generates a fixed set of validation
+    samples at initialization for consistent evaluation.
+    
+    Attributes:
+        batches: Pre-generated list of TokenBatch objects.
+    """
+    
+    def __init__(
+        self,
+        generators: List,
+        n_samples: int = 1000,
+        batch_size: int = 32,
+        n_range: Tuple[int, int] = (50, 500),
+        d_range: Tuple[int, int] = (5, 20),
+        max_rows: int = 256,
+        max_cols: int = 32,
+        apply_masking: bool = False,
+        seed: int = 12345,
+    ):
+        """
+        Initialize validation data loader.
+        
+        Args:
+            generators: List of generator instances.
+            n_samples: Total number of validation samples.
+            batch_size: Samples per batch.
+            n_range: Row range for datasets.
+            d_range: Column range for datasets.
+            max_rows: Max rows for tokenization.
+            max_cols: Max cols for tokenization.
+            apply_masking: Whether to apply artificial masking.
+            seed: Random seed for reproducible validation set.
+        """
+        self.batch_size = batch_size
+        
+        # Create temporary config
+        config = SyntheticDataLoaderConfig(
+            batch_size=batch_size,
+            n_range=n_range,
+            d_range=d_range,
+            max_rows=max_rows,
+            max_cols=max_cols,
+            apply_masking=apply_masking,
+            seed=seed,
+        )
+        
+        # Generate all batches
+        temp_loader = SyntheticDataLoader(
+            generators=generators,
+            config=config,
+        )
+        
+        n_batches = (n_samples + batch_size - 1) // batch_size
+        self.batches = [temp_loader._generate_batch() for _ in range(n_batches)]
+    
+    def __iter__(self) -> Iterator[TokenBatch]:
+        """Iterate over pre-generated batches."""
+        return iter(self.batches)
+    
+    def __len__(self) -> int:
+        """Return number of batches."""
+        return len(self.batches)
+
+
+# =============================================================================
+# Mixed Data Loader (Synthetic + Semi-Synthetic)
+# =============================================================================
+
+class MixedDataLoader:
+    """
+    Data loader that mixes synthetic and semi-synthetic data.
+    
+    Useful for curriculum learning or robustness testing.
+    
+    Attributes:
+        synthetic_loader: SyntheticDataLoader for fully synthetic data.
+        semisynthetic_loader: DataLoader for semi-synthetic data.
+        synthetic_ratio: Fraction of batches from synthetic source.
+    """
+    
+    def __init__(
+        self,
+        synthetic_loader: SyntheticDataLoader,
+        semisynthetic_loader,  # SemiSyntheticDataLoader or similar
+        synthetic_ratio: float = 0.5,
+        seed: int = 42,
+    ):
+        """
+        Initialize mixed data loader.
+        
+        Args:
+            synthetic_loader: Loader for synthetic data.
+            semisynthetic_loader: Loader for semi-synthetic data.
+            synthetic_ratio: Probability of using synthetic loader (0 to 1).
+            seed: Random seed for mixing.
+        """
+        self.synthetic_loader = synthetic_loader
+        self.semisynthetic_loader = semisynthetic_loader
+        self.synthetic_ratio = synthetic_ratio
+        self.rng = np.random.default_rng(seed)
+        
+        self._synthetic_iter = None
+        self._semisynthetic_iter = None
+    
+    def __iter__(self) -> Iterator[TokenBatch]:
+        """Initialize iterators."""
+        self._synthetic_iter = iter(self.synthetic_loader)
+        self._semisynthetic_iter = iter(self.semisynthetic_loader)
+        return self
+    
+    def __next__(self) -> TokenBatch:
+        """Get next batch from either source."""
+        use_synthetic = self.rng.random() < self.synthetic_ratio
+        
+        if use_synthetic:
+            try:
+                return next(self._synthetic_iter)
+            except StopIteration:
+                # Fall back to semi-synthetic
+                return next(self._semisynthetic_iter)
+        else:
+            try:
+                return next(self._semisynthetic_iter)
+            except StopIteration:
+                # Fall back to synthetic
+                return next(self._synthetic_iter)
+    
+    def __len__(self) -> int:
+        """Approximate length."""
+        return len(self.synthetic_loader) + len(self.semisynthetic_loader)
+
+
+# =============================================================================
+# Factory Functions
+# =============================================================================
+
+def create_synthetic_loader(
+    generators: List,
+    batch_size: int = 32,
+    n_range: Tuple[int, int] = (50, 500),
+    d_range: Tuple[int, int] = (5, 20),
+    max_rows: int = 256,
+    max_cols: int = 32,
+    apply_masking: bool = True,
+    mask_ratio: float = 0.15,
+    batches_per_epoch: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> SyntheticDataLoader:
+    """
+    Factory function to create SyntheticDataLoader.
+    
+    Args:
+        generators: List of generator instances.
+        batch_size: Samples per batch.
+        n_range: Row range for datasets.
+        d_range: Column range for datasets.
+        max_rows: Max rows for tokenization.
+        max_cols: Max cols for tokenization.
+        apply_masking: Whether to apply artificial masking.
+        mask_ratio: Fraction of observed values to mask.
+        batches_per_epoch: Batches per epoch (None = infinite).
+        seed: Random seed.
+    
+    Returns:
+        Configured SyntheticDataLoader.
+    """
+    config = SyntheticDataLoaderConfig(
+        batch_size=batch_size,
+        n_range=n_range,
+        d_range=d_range,
         max_rows=max_rows,
         max_cols=max_cols,
-        generator_ids=generator_ids,
-        class_mapping=class_mapping,
+        apply_masking=apply_masking,
+        mask_ratio=mask_ratio,
+        batches_per_epoch=batches_per_epoch,
+        seed=seed,
+    )
+    
+    return SyntheticDataLoader(generators=generators, config=config)
+
+
+def create_validation_loader(
+    generators: List,
+    n_samples: int = 1000,
+    batch_size: int = 32,
+    max_rows: int = 256,
+    max_cols: int = 32,
+    seed: int = 12345,
+) -> ValidationDataLoader:
+    """
+    Factory function to create ValidationDataLoader.
+    
+    Args:
+        generators: List of generator instances.
+        n_samples: Total validation samples.
+        batch_size: Samples per batch.
+        max_rows: Max rows for tokenization.
+        max_cols: Max cols for tokenization.
+        seed: Random seed for reproducibility.
+    
+    Returns:
+        Configured ValidationDataLoader.
+    """
+    return ValidationDataLoader(
+        generators=generators,
+        n_samples=n_samples,
+        batch_size=batch_size,
+        max_rows=max_rows,
+        max_cols=max_cols,
+        apply_masking=False,  # No masking for validation
+        seed=seed,
     )
