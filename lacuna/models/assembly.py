@@ -9,6 +9,19 @@ This module wires together all components of the BERT-inspired architecture:
     3. Mixture of Experts: Produces mechanism posteriors
     4. Decision Rule: Converts posteriors to actionable decisions
 
+CRITICAL FIX (2026-01-10):
+--------------------------
+The MoE gating network now receives NATURAL reconstruction errors (errors on
+naturally missing cells) rather than ARTIFICIAL errors (errors on self-supervised
+masked cells). This is the key to MAR/MNAR discrimination:
+
+    - MAR: MARHead predicts naturally missing values WELL (low error)
+           because cross-attention to observed values helps
+    - MNAR: MARHead predicts naturally missing values POORLY (high error)
+           because the missing value itself is what determines missingness
+
+The error PATTERN across heads is the discriminative signal.
+
 Architecture Overview:
 
     Input: TokenBatch
@@ -27,12 +40,12 @@ Architecture Overview:
         │              │  MCAR | MAR | MNAR variants │
         │              └─────────────────────────────┘
         │                           │
-        │                           │ errors [B, n_heads]
+        │                           │ natural_errors [B, n_heads]  <-- KEY FIX
         │                           │
         ▼                           ▼
     ┌─────────────────────────────────────────────────────────────────┐
     │                      MixtureOfExperts                           │
-    │  evidence + errors → GatingNetwork → (ExpertHeads) → posterior  │
+    │  evidence + natural_errors → GatingNetwork → posterior          │
     └─────────────────────────────────────────────────────────────────┘
         │
         │ p_class [B, 3], p_mechanism [B, n_experts]
@@ -348,6 +361,9 @@ class LacunaModel(nn.Module):
         - Classification: Only mechanism loss, learns to classify
         - Joint: Both losses, full training
     
+    CRITICAL: The MoE receives NATURAL reconstruction errors (errors on
+    naturally missing cells) as the discriminative signal for MAR vs MNAR.
+    
     Attributes:
         config: LacunaModelConfig with all architecture parameters.
         encoder: LacunaEncoder for tokenization and evidence extraction.
@@ -399,6 +415,14 @@ class LacunaModel(nn.Module):
         """
         Full forward pass through Lacuna.
         
+        CRITICAL FIX (2026-01-10):
+        The MoE gating now receives NATURAL reconstruction errors (errors on
+        naturally missing cells) rather than ARTIFICIAL errors. This is the
+        key to MAR/MNAR discrimination:
+        
+            - MAR: MARHead predicts naturally missing values WELL (low error)
+            - MNAR: MARHead predicts naturally missing values POORLY (high error)
+        
         Args:
             batch: TokenBatch containing tokenized datasets.
             compute_reconstruction: Whether to compute reconstruction predictions.
@@ -431,9 +455,10 @@ class LacunaModel(nn.Module):
         
         # === 2. Reconstruction ===
         reconstruction_results = None
-        reconstruction_errors = None
+        reconstruction_errors_for_moe = None
         
         if compute_reconstruction:
+            # Compute reconstruction with BOTH artificial and natural errors
             reconstruction_results = self.reconstruction(
                 token_repr=token_repr,
                 tokens=batch.tokens,
@@ -441,15 +466,28 @@ class LacunaModel(nn.Module):
                 col_mask=batch.col_mask,
                 original_values=batch.original_values,
                 reconstruction_mask=batch.reconstruction_mask,
+                compute_natural_errors=True,  # CRITICAL: compute natural errors
             )
             
-            # Get error tensor for MoE input
-            reconstruction_errors = self.reconstruction.get_error_tensor(reconstruction_results)
+            # CRITICAL FIX: Use NATURAL errors for MoE, not artificial errors
+            # Natural errors are the discriminative signal for MAR vs MNAR:
+            #   - MAR: MARHead error < MCARHead error (cross-attention helps)
+            #   - MNAR: MARHead error >= MCARHead error (cross-attention doesn't help)
+            natural_errors = self.reconstruction.get_natural_error_tensor(reconstruction_results)
+            
+            if natural_errors is not None:
+                # Use natural errors as the discrimination signal
+                reconstruction_errors_for_moe = natural_errors
+            else:
+                # Fallback to artificial errors if natural not available
+                # (e.g., if original_values not provided)
+                reconstruction_errors_for_moe = self.reconstruction.get_error_tensor(reconstruction_results)
         
         # === 3. Mixture of Experts ===
+        # Pass natural reconstruction errors as the discrimination signal
         moe_output = self.moe(
             evidence=evidence,
-            reconstruction_errors=reconstruction_errors,
+            reconstruction_errors=reconstruction_errors_for_moe,
         )
         
         # === 4. Build PosteriorResult ===
@@ -467,10 +505,16 @@ class LacunaModel(nn.Module):
         entropy_mechanism = compute_entropy(p_mechanism)
         
         # Build reconstruction errors dict for PosteriorResult
+        # Store NATURAL errors (for analysis) if available
         recon_errors_dict = {}
         if reconstruction_results is not None:
             for name in self.reconstruction.head_names:
-                recon_errors_dict[name] = reconstruction_results[name].errors
+                result = reconstruction_results[name]
+                # Prefer natural errors if available
+                if hasattr(result, 'natural_errors') and result.natural_errors is not None:
+                    recon_errors_dict[name] = result.natural_errors
+                else:
+                    recon_errors_dict[name] = result.errors
         
         posterior = PosteriorResult(
             p_class=p_class,
@@ -558,7 +602,7 @@ class LacunaModel(nn.Module):
         Returns:
             Dict with loss names and values.
         """
-        return self.moe.get_auxiliary_losses(output.moe_output)
+        return self.moe.get_auxiliary_losses(output.moe)
     
     def encode(self, batch: TokenBatch) -> torch.Tensor:
         """
