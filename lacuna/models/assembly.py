@@ -1,92 +1,27 @@
 """
 lacuna.models.assembly
 
-Complete Lacuna model assembly.
+Complete Lacuna model assembling all components.
 
-This module wires together all components of the BERT-inspired architecture:
-    1. Encoder: Tokenizes data and produces evidence vectors
-    2. Reconstruction Heads: Predict masked values (self-supervised pretraining)
-    3. Mixture of Experts: Produces mechanism posteriors
-    4. Decision Rule: Converts posteriors to actionable decisions
+Enhanced with explicit missingness pattern features for improved MAR/MCAR discrimination.
 
-CRITICAL FIX (2026-01-10):
---------------------------
-The MoE gating network now receives NATURAL reconstruction errors (errors on
-naturally missing cells) rather than ARTIFICIAL errors (errors on self-supervised
-masked cells). This is the key to MAR/MNAR discrimination:
+Architecture:
+    1. Encoder: Tokenized data -> evidence vector + token representations
+    2. Reconstruction Heads: Predict masked values (natural error = discrimination signal)
+    3. Missingness Feature Extractor: Explicit statistical features of missingness patterns
+    4. Mixture of Experts: Combine all signals for mechanism classification
+    5. Bayes-Optimal Decision: Convert posteriors to recommended actions
 
-    - MAR: MARHead predicts naturally missing values WELL (low error)
-           because cross-attention to observed values helps
-    - MNAR: MARHead predicts naturally missing values POORLY (high error)
-           because the missing value itself is what determines missingness
-
-The error PATTERN across heads is the discriminative signal.
-
-CRITICAL FIX (2026-01-10) - CLASS AGGREGATION:
-----------------------------------------------
-The original MoE had 1 MCAR expert, 1 MAR expert, and 3 MNAR experts. When
-summing expert probabilities to get class probabilities, this created a 3x
-structural prior toward MNAR (60% vs 20% vs 20% at initialization).
-
-The fix: Use "mean" aggregation (default) which averages expert probabilities
-per class before re-normalizing, giving equal prior weight to each class.
-
-Architecture Overview:
-
-    Input: TokenBatch
-        │
-        ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                        LacunaEncoder                            │
-    │  tokens → TokenEmbedding → Transformer → RowPool → DatasetPool  │
-    └─────────────────────────────────────────────────────────────────┘
-        │                           │
-        │ evidence [B, evidence_dim]│ token_repr [B, max_rows, max_cols, hidden_dim]
-        │                           │
-        │                           ▼
-        │              ┌─────────────────────────────┐
-        │              │    ReconstructionHeads      │
-        │              │  MCAR | MAR | MNAR variants │
-        │              └─────────────────────────────┘
-        │                           │
-        │                           │ natural_errors [B, n_heads]  <-- KEY FIX
-        │                           │
-        ▼                           ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                      MixtureOfExperts                           │
-    │  evidence + natural_errors → GatingNetwork → posterior          │
-    │  get_class_posterior() uses BALANCED aggregation                │
-    └─────────────────────────────────────────────────────────────────┘
-        │
-        │ p_class [B, 3], p_mechanism [B, n_experts]
-        │
-        ▼
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                      BayesOptimalDecision                       │
-    │  p_class + loss_matrix → action (Green/Yellow/Red)              │
-    └─────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-    LacunaOutput (posterior, decision, reconstruction, moe_output, evidence)
+The key enhancement is the MissingnessFeatureExtractor which computes 16 statistical
+features that strongly discriminate between mechanisms:
+    - Missing rate statistics (variance, range) -> MCAR vs MAR (d > 9.0)
+    - Little's test approximation -> MAR vs MNAR (d > 2.8)
+    - Cross-column correlations -> Additional discrimination signal
 
 Training Modes:
     1. Pretraining: Reconstruction loss only (self-supervised)
     2. Classification: Mechanism loss only (supervised on synthetic data)
     3. Joint: Reconstruction + Mechanism loss (full training)
-
-Usage:
-    # Create model
-    model = create_lacuna_model(config)
-    
-    # Forward pass
-    output = model(batch)
-    
-    # Access components
-    posterior = output.posterior       # PosteriorResult
-    decision = output.decision         # Decision
-    recon = output.reconstruction      # Dict[str, ReconstructionResult]
-    moe = output.moe_output           # MoEOutput
-    evidence = output.evidence        # [B, evidence_dim]
 """
 
 import torch
@@ -116,6 +51,11 @@ from lacuna.models.reconstruction import (
 )
 from lacuna.models.moe import MixtureOfExperts, MoEConfig, create_moe
 from lacuna.data.tokenization import TOKEN_DIM
+from lacuna.data.missingness_features import (
+    MissingnessFeatureExtractor,
+    MissingnessFeatureConfig,
+    DEFAULT_CONFIG as DEFAULT_MISSINGNESS_CONFIG,
+)
 
 
 # =============================================================================
@@ -140,82 +80,61 @@ class LacunaModelConfig:
     recon_n_head_layers: int = 2      # Depth of reconstruction heads
     mnar_variants: List[str] = None   # MNAR variant names
     
+    # === Missingness Features ===
+    use_missingness_features: bool = True  # Extract explicit missingness features
+    
     # === MoE ===
     gate_hidden_dim: int = 64         # Gating network hidden dimension
     gate_n_layers: int = 2            # Gating network depth
     gating_level: str = "dataset"     # "dataset" or "row"
     use_reconstruction_errors: bool = True  # Feed recon errors to gate
     use_expert_heads: bool = False    # Use expert refinement heads
+    
+    # === Calibration ===
     temperature: float = 1.0          # Softmax temperature
-    learn_temperature: bool = False   # Learn temperature
-    load_balance_weight: float = 0.0  # MoE load balancing loss weight
+    learn_temperature: bool = False   # Learn temperature as parameter
     
-    # === Class Aggregation (CRITICAL FIX) ===
-    # Method for aggregating expert probabilities to class probabilities
-    # "mean": Balanced - normalizes by expert count per class (RECOMMENDED)
-    #         Gives equal prior to each class regardless of expert count
-    # "sum": Original biased behavior - classes with more experts get higher prior
-    # "learned": Learnable bias correction
-    class_aggregation: str = "mean"
-    
-    # === Decision ===
-    # Loss matrix for Bayes-optimal decision rule
-    # Rows: actions (Green, Yellow, Red)
-    # Cols: true states (MCAR, MAR, MNAR)
-    # Entry (a, s) = cost of taking action a when true state is s
-    loss_matrix: List[float] = None
+    # === Aggregation ===
+    class_aggregation: str = "mean"   # "mean", "sum", or "learned"
     
     # === Regularization ===
-    dropout: float = 0.1
+    load_balance_weight: float = 0.0  # MoE load balancing loss weight
+    dropout: float = 0.1              # Dropout probability
+    
+    # === Decision Rule ===
+    loss_matrix: List[float] = field(default_factory=lambda: [
+        # Green action (assume MCAR)
+        0.0, 0.3, 1.0,   # True: MCAR, MAR, MNAR
+        # Yellow action (assume MAR)
+        0.2, 0.0, 0.2,   # True: MCAR, MAR, MNAR
+        # Red action (assume MNAR)
+        1.0, 0.3, 0.0,   # True: MCAR, MAR, MNAR
+    ])
     
     def __post_init__(self):
         if self.mnar_variants is None:
             self.mnar_variants = ["self_censoring", "threshold", "latent"]
         
-        if self.loss_matrix is None:
-            # Default loss matrix:
-            #          MCAR  MAR  MNAR
-            # Green:    0     0    10   (high cost for ignoring MNAR)
-            # Yellow:   1     1     2   (moderate cost, conservative)
-            # Red:      3     2     0   (high cost for over-reacting to MCAR/MAR)
-            self.loss_matrix = [
-                0.0, 0.0, 10.0,  # Green
-                1.0, 1.0,  2.0,  # Yellow
-                3.0, 2.0,  0.0,  # Red
-            ]
-        
-        # Validate class_aggregation
-        if self.class_aggregation not in ("mean", "sum", "learned"):
-            raise ValueError(
-                f"class_aggregation must be 'mean', 'sum', or 'learned', "
-                f"got {self.class_aggregation}"
+        if self.hidden_dim % self.n_heads != 0:
+            raise ValidationError(
+                f"hidden_dim ({self.hidden_dim}) must be divisible by n_heads ({self.n_heads})"
             )
     
-    @property
-    def n_experts(self) -> int:
-        """Total number of mechanism experts."""
-        return 2 + len(self.mnar_variants)  # MCAR + MAR + MNAR variants
-    
-    @property
-    def n_reconstruction_heads(self) -> int:
-        """Total number of reconstruction heads."""
-        return self.n_experts  # Same as experts: MCAR, MAR, MNAR variants
-    
     def get_encoder_config(self) -> EncoderConfig:
-        """Create EncoderConfig from model config."""
+        """Create EncoderConfig from this config."""
         return EncoderConfig(
             hidden_dim=self.hidden_dim,
             evidence_dim=self.evidence_dim,
             n_layers=self.n_layers,
             n_heads=self.n_heads,
             max_cols=self.max_cols,
-            dropout=self.dropout,
             row_pooling=self.row_pooling,
             dataset_pooling=self.dataset_pooling,
+            dropout=self.dropout,
         )
     
     def get_reconstruction_config(self) -> ReconstructionConfig:
-        """Create ReconstructionConfig from model config."""
+        """Create ReconstructionConfig from this config."""
         return ReconstructionConfig(
             hidden_dim=self.hidden_dim,
             head_hidden_dim=self.recon_head_hidden_dim,
@@ -225,22 +144,30 @@ class LacunaModelConfig:
         )
     
     def get_moe_config(self) -> MoEConfig:
-        """Create MoEConfig from model config."""
+        """Create MoEConfig from this config."""
+        # Calculate number of reconstruction heads
+        n_recon_heads = 2 + len(self.mnar_variants)  # mcar + mar + mnar variants
+        
+        # Calculate number of missingness features
+        n_miss_features = DEFAULT_MISSINGNESS_CONFIG.n_features if self.use_missingness_features else 0
+        
         return MoEConfig(
             evidence_dim=self.evidence_dim,
             hidden_dim=self.hidden_dim,
             mnar_variants=self.mnar_variants,
             gate_hidden_dim=self.gate_hidden_dim,
             gate_n_layers=self.gate_n_layers,
-            gate_dropout=self.dropout,
             gating_level=self.gating_level,
             use_reconstruction_errors=self.use_reconstruction_errors,
-            n_reconstruction_heads=self.n_reconstruction_heads,
+            n_reconstruction_heads=n_recon_heads,
+            use_missingness_features=self.use_missingness_features,
+            n_missingness_features=n_miss_features,
             use_expert_heads=self.use_expert_heads,
             temperature=self.temperature,
             learn_temperature=self.learn_temperature,
-            class_aggregation=self.class_aggregation,  # Pass through to MoE
+            class_aggregation=self.class_aggregation,
             load_balance_weight=self.load_balance_weight,
+            gate_dropout=self.dropout,
         )
 
 
@@ -248,109 +175,94 @@ class LacunaModelConfig:
 # Bayes-Optimal Decision Rule
 # =============================================================================
 
+def compute_entropy(probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Compute entropy of probability distribution."""
+    log_probs = torch.log(probs.clamp(min=eps))
+    return -(probs * log_probs).sum(dim=-1)
+
+
 class BayesOptimalDecision(nn.Module):
     """
     Bayes-optimal decision rule for mechanism classification.
     
-    Given a posterior over mechanism classes and a loss matrix specifying
-    the cost of each action under each true state, computes the action
-    that minimizes expected risk.
+    Given posterior P(class | data) and loss matrix L[action, true_class],
+    choose action that minimizes expected loss:
     
-    Actions:
-        0 = Green: Proceed with standard analysis (assume MCAR/MAR)
-        1 = Yellow: Proceed with caution, sensitivity analysis recommended
-        2 = Red: Stop, mechanism likely MNAR, standard methods invalid
+        action* = argmin_a sum_c P(c | data) * L[a, c]
     
-    Decision rule:
-        action* = argmin_a E[L(a, s)] = argmin_a sum_s p(s) * L(a, s)
-    
-    Attributes:
-        loss_matrix: [n_actions, n_classes] loss matrix.
-        action_names: Tuple of action names for output.
+    Default loss matrix encodes:
+        - Green (assume MCAR): High loss if MNAR, moderate if MAR
+        - Yellow (assume MAR): Moderate loss if wrong
+        - Red (assume MNAR): High loss if MCAR (over-conservative)
     """
     
-    def __init__(
-        self,
-        loss_matrix: torch.Tensor,
-        action_names: Tuple[str, str, str] = ("Green", "Yellow", "Red"),
-    ):
+    def __init__(self, loss_matrix: torch.Tensor):
+        """
+        Initialize decision rule.
+        
+        Args:
+            loss_matrix: [n_actions, n_classes] loss matrix.
+        """
         super().__init__()
         
+        if loss_matrix.shape != (3, 3):
+            raise ValueError(f"loss_matrix must be [3, 3], got {loss_matrix.shape}")
+        
         self.register_buffer("loss_matrix", loss_matrix)
-        self.action_names = action_names
     
-    def forward(
-        self,
-        p_class: torch.Tensor,
-    ) -> Decision:
+    def forward(self, p_class: torch.Tensor) -> Decision:
         """
         Compute Bayes-optimal decision.
         
         Args:
-            p_class: Class posterior. Shape: [B, n_classes]
+            p_class: [B, 3] posterior over classes.
         
         Returns:
-            decision: Decision object with action_ids, expected_risks, confidence.
+            Decision with action IDs and expected risks.
         """
-        decision, _ = self.forward_with_risks(p_class)
-        return decision
-    
-    def forward_with_risks(
-        self,
-        p_class: torch.Tensor,
-    ) -> Tuple[Decision, torch.Tensor]:
-        """
-        Compute Bayes-optimal decision with all expected risks.
-        
-        Args:
-            p_class: Class posterior. Shape: [B, n_classes]
-        
-        Returns:
-            decision: Decision object.
-            all_risks: Expected risks for all actions. Shape: [B, n_actions]
-        """
-        # Compute expected risk for each action
-        # expected_risks[b, a] = sum_s p_class[b, s] * loss_matrix[a, s]
+        # Expected risk for each action: [B, n_actions]
+        # risk[b, a] = sum_c P(c | data_b) * L[a, c]
         expected_risks = torch.matmul(p_class, self.loss_matrix.T)
         
-        # Select action with minimum expected risk
+        # Bayes-optimal action: minimize expected risk
         action_ids = expected_risks.argmin(dim=-1)
-        min_risks = expected_risks.gather(1, action_ids.unsqueeze(-1)).squeeze(-1)
         
-        # Compute confidence as normalized risk range
-        max_risks = expected_risks.max(dim=-1).values
-        risk_range = (max_risks - min_risks).clamp(min=1e-8)
-        confidence = risk_range / max_risks.clamp(min=1e-8)
+        # Minimum expected risk (for confidence)
+        min_risks = expected_risks.min(dim=-1).values
         
-        decision = Decision(
+        return Decision(
             action_ids=action_ids,
-            action_names=self.action_names,
             expected_risks=min_risks,
-            confidence=confidence,
+            all_risks=expected_risks,
         )
-        
-        return decision, expected_risks
 
 
 # =============================================================================
-# Entropy Computation
+# Decision Data Class
 # =============================================================================
 
-def compute_entropy(probs: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    Compute entropy of probability distribution.
+@dataclass
+class Decision:
+    """Output of Bayes-optimal decision rule."""
     
-    Args:
-        probs: Probability tensor (should sum to 1 along dim).
-        dim: Dimension along which to compute entropy.
+    action_ids: torch.Tensor      # [B] action indices (0=Green, 1=Yellow, 2=Red)
+    expected_risks: torch.Tensor  # [B] minimum expected risk
+    all_risks: torch.Tensor       # [B, 3] expected risk for each action
     
-    Returns:
-        entropy: Entropy values. Shape is probs.shape with dim removed.
-    """
-    # Clamp to avoid log(0)
-    log_probs = torch.log(probs.clamp(min=1e-8))
-    entropy = -(probs * log_probs).sum(dim=dim)
-    return entropy
+    ACTION_NAMES = ["Green", "Yellow", "Red"]
+    ACTION_DESCRIPTIONS = [
+        "Assume MCAR - proceed with complete-case or simple imputation",
+        "Assume MAR - use multiple imputation or likelihood methods",
+        "Assume MNAR - use sensitivity analysis or selection models",
+    ]
+    
+    def get_actions(self) -> List[str]:
+        """Get action names for batch."""
+        return [self.ACTION_NAMES[i] for i in self.action_ids.tolist()]
+    
+    def get_descriptions(self) -> List[str]:
+        """Get action descriptions for batch."""
+        return [self.ACTION_DESCRIPTIONS[i] for i in self.action_ids.tolist()]
 
 
 # =============================================================================
@@ -361,37 +273,20 @@ class LacunaModel(nn.Module):
     """
     Complete Lacuna model for missing data mechanism classification.
     
-    Combines:
-        1. LacunaEncoder: Tokenizes data, produces evidence vectors
-        2. ReconstructionHeads: Predict masked values (self-supervised)
-        3. MixtureOfExperts: Produces mechanism posteriors
-        4. BayesOptimalDecision: Converts posteriors to decisions
+    This model combines:
+        1. Transformer encoder for learning data representations
+        2. Reconstruction heads for self-supervised pretraining
+        3. Missingness feature extractor for explicit pattern statistics
+        4. Mixture of Experts for mechanism classification
+        5. Bayes-optimal decision rule for action recommendations
     
-    The model can operate in three modes:
-        - Pretraining: Only reconstruction loss, learns data structure
-        - Classification: Only mechanism loss, learns to classify
-        - Joint: Both losses, full training
-    
-    CRITICAL: The MoE receives NATURAL reconstruction errors (errors on
-    naturally missing cells) as the discriminative signal for MAR vs MNAR.
+    The MoE gating network receives three types of signals:
+        - Evidence vector: Learned representation from encoder
+        - Reconstruction errors: How well each head predicts missing values
+        - Missingness features: Explicit statistical patterns (critical for MCAR vs MAR)
     
     CRITICAL: The MoE uses BALANCED class aggregation (default "mean") to
     avoid structural prior bias toward MNAR from having more MNAR experts.
-    
-    Attributes:
-        config: LacunaModelConfig with all architecture parameters.
-        encoder: LacunaEncoder for tokenization and evidence extraction.
-        reconstruction: ReconstructionHeads for self-supervised pretraining.
-        moe: MixtureOfExperts for mechanism classification.
-        decision_rule: BayesOptimalDecision for action selection.
-    
-    Example:
-        >>> config = LacunaModelConfig()
-        >>> model = LacunaModel(config)
-        >>> batch = TokenBatch(...)
-        >>> output = model(batch)
-        >>> print(output.posterior.p_class)  # [B, 3]
-        >>> print(output.decision.action_ids)  # [B]
     """
     
     def __init__(self, config: LacunaModelConfig):
@@ -405,16 +300,20 @@ class LacunaModel(nn.Module):
         # === Reconstruction Heads ===
         self.reconstruction = ReconstructionHeads(config.get_reconstruction_config())
         
+        # === Missingness Feature Extractor ===
+        if config.use_missingness_features:
+            self.missingness_extractor = MissingnessFeatureExtractor()
+        else:
+            self.missingness_extractor = None
+        
         # === Mixture of Experts ===
         self.moe = MixtureOfExperts(config.get_moe_config())
         
         # === Decision Rule ===
-        # Parse loss matrix from flat list to [n_actions, n_classes] tensor
         loss_matrix = torch.tensor(config.loss_matrix).reshape(3, 3)
         self.decision_rule = BayesOptimalDecision(loss_matrix)
         
         # === Class mapping for backward compatibility ===
-        # Maps expert index to class index (MCAR=0, MAR=1, MNAR=2)
         self.register_buffer(
             "expert_to_class",
             torch.tensor([MCAR, MAR] + [MNAR] * len(config.mnar_variants))
@@ -429,35 +328,24 @@ class LacunaModel(nn.Module):
         """
         Full forward pass through Lacuna.
         
-        CRITICAL FIX (2026-01-10):
-        The MoE gating now receives NATURAL reconstruction errors (errors on
-        naturally missing cells) rather than ARTIFICIAL errors. This is the
-        key to MAR/MNAR discrimination:
-        
-            - MAR: MARHead predicts naturally missing values WELL (low error)
-            - MNAR: MARHead predicts naturally missing values POORLY (high error)
+        The MoE gating now receives THREE types of signals:
+            1. Evidence vector from encoder
+            2. Natural reconstruction errors (MAR vs MNAR discrimination)
+            3. Missingness pattern features (MCAR vs MAR discrimination)
         
         Args:
             batch: TokenBatch containing tokenized datasets.
             compute_reconstruction: Whether to compute reconstruction predictions.
-                                   Set False for faster inference if not needed.
             compute_decision: Whether to compute Bayes-optimal decision.
-                             Set False if only posteriors are needed.
         
         Returns:
-            LacunaOutput containing all model outputs:
-                - posterior: PosteriorResult with mechanism probabilities
-                - decision: Decision with recommended action (if compute_decision)
-                - reconstruction: Dict of ReconstructionResult (if compute_reconstruction)
-                - moe_output: MoEOutput with gating details
-                - evidence: Evidence vector [B, evidence_dim]
+            LacunaOutput containing all model outputs.
         """
         # Move batch to correct device if needed
         device = next(self.parameters()).device
         batch = batch.to(device)
         
         # === 1. Encode ===
-        # Get both evidence vector and token representations
         encoder_output = self.encoder(
             batch.tokens,
             batch.row_mask,
@@ -472,7 +360,6 @@ class LacunaModel(nn.Module):
         reconstruction_errors_for_moe = None
         
         if compute_reconstruction:
-            # Compute reconstruction with BOTH artificial and natural errors
             reconstruction_results = self.reconstruction(
                 token_repr=token_repr,
                 tokens=batch.tokens,
@@ -480,39 +367,43 @@ class LacunaModel(nn.Module):
                 col_mask=batch.col_mask,
                 original_values=batch.original_values,
                 reconstruction_mask=batch.reconstruction_mask,
-                compute_natural_errors=True,  # CRITICAL: compute natural errors
+                compute_natural_errors=True,
             )
             
-            # CRITICAL FIX: Use NATURAL errors for MoE, not artificial errors
-            # Natural errors are the discriminative signal for MAR vs MNAR:
-            #   - MAR: MARHead error < MCARHead error (cross-attention helps)
-            #   - MNAR: MARHead error >= MCARHead error (cross-attention doesn't help)
+            # Use natural errors for MoE discrimination
             natural_errors = self.reconstruction.get_natural_error_tensor(reconstruction_results)
             
             if natural_errors is not None:
-                # Use natural errors as the discrimination signal
                 reconstruction_errors_for_moe = natural_errors
             else:
-                # Fallback to artificial errors if natural not available
-                # (e.g., if original_values not provided)
                 reconstruction_errors_for_moe = self.reconstruction.get_error_tensor(reconstruction_results)
         
-        # === 3. Mixture of Experts ===
-        # Pass natural reconstruction errors as the discrimination signal
+        # === 3. Missingness Features ===
+        missingness_features = None
+        if self.missingness_extractor is not None:
+            missingness_features = self.missingness_extractor(
+                batch.tokens,
+                batch.row_mask,
+                batch.col_mask,
+            )
+            # Safety check for NaN/Inf
+            if torch.isnan(missingness_features).any() or torch.isinf(missingness_features).any():
+                missingness_features = torch.where(
+                    torch.isnan(missingness_features) | torch.isinf(missingness_features),
+                    torch.zeros_like(missingness_features),
+                    missingness_features
+                )
+        
+        # === 4. Mixture of Experts ===
         moe_output = self.moe(
             evidence=evidence,
             reconstruction_errors=reconstruction_errors_for_moe,
+            missingness_features=missingness_features,
         )
         
-        # === 4. Build PosteriorResult ===
-        # Get class posterior (aggregates MNAR variants)
-        # Uses BALANCED aggregation by default to avoid MNAR prior bias
+        # === 5. Build PosteriorResult ===
         p_class = self.moe.get_class_posterior(moe_output)
-        
-        # Get MNAR variant posterior (conditional on MNAR)
         p_mnar_variant = self.moe.get_mnar_variant_posterior(moe_output)
-        
-        # Full mechanism posterior (MCAR, MAR, MNAR_variant1, ...)
         p_mechanism = moe_output.gate_probs
         
         # Compute entropies
@@ -520,12 +411,10 @@ class LacunaModel(nn.Module):
         entropy_mechanism = compute_entropy(p_mechanism)
         
         # Build reconstruction errors dict for PosteriorResult
-        # Store NATURAL errors (for analysis) if available
         recon_errors_dict = {}
         if reconstruction_results is not None:
             for name in self.reconstruction.head_names:
                 result = reconstruction_results[name]
-                # Prefer natural errors if available
                 if hasattr(result, 'natural_errors') and result.natural_errors is not None:
                     recon_errors_dict[name] = result.natural_errors
                 else:
@@ -537,18 +426,18 @@ class LacunaModel(nn.Module):
             p_mechanism=p_mechanism,
             entropy_class=entropy_class,
             entropy_mechanism=entropy_mechanism,
-            logits_class=None,  # We don't have class-level logits directly
+            logits_class=None,
             logits_mnar_variant=None,
             gate_probs=moe_output.gate_probs,
             reconstruction_errors=recon_errors_dict if recon_errors_dict else None,
         )
         
-        # === 5. Decision ===
+        # === 6. Decision ===
         decision = None
         if compute_decision:
             decision = self.decision_rule(p_class)
         
-        # === 6. Assemble Output ===
+        # === 7. Assemble Output ===
         return LacunaOutput(
             posterior=posterior,
             decision=decision,
@@ -564,13 +453,8 @@ class LacunaModel(nn.Module):
         """
         Simplified forward for classification only (no reconstruction).
         
-        Faster inference when reconstruction is not needed.
-        
-        Args:
-            batch: TokenBatch containing tokenized datasets.
-        
-        Returns:
-            PosteriorResult with mechanism probabilities.
+        Note: This still computes missingness features as they don't require
+        reconstruction and are critical for MCAR vs MAR discrimination.
         """
         output = self.forward(
             batch,
@@ -583,18 +467,7 @@ class LacunaModel(nn.Module):
         self,
         batch: TokenBatch,
     ) -> Tuple[PosteriorResult, Decision]:
-        """
-        Forward pass returning posterior and decision.
-        
-        Convenience method for inference workflows.
-        
-        Args:
-            batch: TokenBatch containing tokenized datasets.
-        
-        Returns:
-            posterior: PosteriorResult with mechanism probabilities.
-            decision: Decision with recommended action.
-        """
+        """Forward pass returning posterior and decision."""
         output = self.forward(
             batch,
             compute_reconstruction=False,
@@ -606,29 +479,11 @@ class LacunaModel(nn.Module):
         self,
         output: LacunaOutput,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Compute auxiliary losses for training.
-        
-        Includes MoE regularization losses (load balancing, entropy).
-        
-        Args:
-            output: Output from forward().
-        
-        Returns:
-            Dict with loss names and values.
-        """
+        """Compute auxiliary losses for training."""
         return self.moe.get_auxiliary_losses(output.moe)
     
     def encode(self, batch: TokenBatch) -> torch.Tensor:
-        """
-        Get evidence vector only (for analysis/visualization).
-        
-        Args:
-            batch: TokenBatch containing tokenized datasets.
-        
-        Returns:
-            evidence: Evidence vector. Shape: [B, evidence_dim]
-        """
+        """Get evidence vector only."""
         device = next(self.parameters()).device
         batch = batch.to(device)
         
@@ -643,16 +498,7 @@ class LacunaModel(nn.Module):
         self,
         batch: TokenBatch,
     ) -> torch.Tensor:
-        """
-        Get token-level representations (for reconstruction analysis).
-        
-        Args:
-            batch: TokenBatch containing tokenized datasets.
-        
-        Returns:
-            token_repr: Token representations.
-                       Shape: [B, max_rows, max_cols, hidden_dim]
-        """
+        """Get token-level representations."""
         device = next(self.parameters()).device
         batch = batch.to(device)
         
@@ -662,24 +508,18 @@ class LacunaModel(nn.Module):
             batch.col_mask,
         )
     
-    def get_row_representations(
+    def get_missingness_features(
         self,
         batch: TokenBatch,
-    ) -> torch.Tensor:
-        """
-        Get row-level representations (for row-level analysis).
+    ) -> Optional[torch.Tensor]:
+        """Get explicit missingness pattern features."""
+        if self.missingness_extractor is None:
+            return None
         
-        Args:
-            batch: TokenBatch containing tokenized datasets.
-        
-        Returns:
-            row_repr: Row representations.
-                     Shape: [B, max_rows, hidden_dim]
-        """
         device = next(self.parameters()).device
         batch = batch.to(device)
         
-        return self.encoder.get_row_representations(
+        return self.missingness_extractor(
             batch.tokens,
             batch.row_mask,
             batch.col_mask,
@@ -691,7 +531,6 @@ class LacunaModel(nn.Module):
 # =============================================================================
 
 def create_lacuna_model(
-    # Encoder
     hidden_dim: int = 128,
     evidence_dim: int = 64,
     n_layers: int = 4,
@@ -699,11 +538,10 @@ def create_lacuna_model(
     max_cols: int = 32,
     row_pooling: str = "attention",
     dataset_pooling: str = "attention",
-    # Reconstruction
     recon_head_hidden_dim: int = 64,
     recon_n_head_layers: int = 2,
     mnar_variants: Optional[List[str]] = None,
-    # MoE
+    use_missingness_features: bool = True,
     gate_hidden_dim: int = 64,
     gate_n_layers: int = 2,
     gating_level: str = "dataset",
@@ -711,11 +549,9 @@ def create_lacuna_model(
     use_expert_heads: bool = False,
     temperature: float = 1.0,
     learn_temperature: bool = False,
-    load_balance_weight: float = 0.0,
     class_aggregation: str = "mean",
-    # Decision
+    load_balance_weight: float = 0.0,
     loss_matrix: Optional[List[float]] = None,
-    # Regularization
     dropout: float = 0.1,
 ) -> LacunaModel:
     """
@@ -727,11 +563,12 @@ def create_lacuna_model(
         n_layers: Number of transformer layers.
         n_heads: Number of attention heads.
         max_cols: Maximum number of columns.
-        row_pooling: Row pooling method ("mean", "max", "attention").
+        row_pooling: Row pooling method.
         dataset_pooling: Dataset pooling method.
         recon_head_hidden_dim: Reconstruction head hidden dimension.
         recon_n_head_layers: Reconstruction head depth.
         mnar_variants: List of MNAR variant names.
+        use_missingness_features: Extract explicit missingness pattern features.
         gate_hidden_dim: Gating network hidden dimension.
         gate_n_layers: Gating network depth.
         gating_level: "dataset" or "row".
@@ -739,21 +576,23 @@ def create_lacuna_model(
         use_expert_heads: Use expert refinement heads.
         temperature: Softmax temperature for calibration.
         learn_temperature: Learn temperature as parameter.
-        load_balance_weight: MoE load balancing loss weight.
         class_aggregation: Method for aggregating expert probs to class probs.
-                          "mean" (default, balanced), "sum" (biased), or "learned".
+        load_balance_weight: MoE load balancing loss weight.
         loss_matrix: Bayes decision loss matrix (flat list, row-major).
         dropout: Dropout probability.
     
     Returns:
         Configured LacunaModel instance.
-    
-    Example:
-        >>> model = create_lacuna_model(hidden_dim=256, n_layers=6)
-        >>> output = model(batch)
     """
     if mnar_variants is None:
         mnar_variants = ["self_censoring", "threshold", "latent"]
+    
+    if loss_matrix is None:
+        loss_matrix = [
+            0.0, 0.3, 1.0,   # Green
+            0.2, 0.0, 0.2,   # Yellow
+            1.0, 0.3, 0.0,   # Red
+        ]
     
     config = LacunaModelConfig(
         hidden_dim=hidden_dim,
@@ -766,6 +605,7 @@ def create_lacuna_model(
         recon_head_hidden_dim=recon_head_hidden_dim,
         recon_n_head_layers=recon_n_head_layers,
         mnar_variants=mnar_variants,
+        use_missingness_features=use_missingness_features,
         gate_hidden_dim=gate_hidden_dim,
         gate_n_layers=gate_n_layers,
         gating_level=gating_level,
@@ -773,10 +613,10 @@ def create_lacuna_model(
         use_expert_heads=use_expert_heads,
         temperature=temperature,
         learn_temperature=learn_temperature,
-        load_balance_weight=load_balance_weight,
         class_aggregation=class_aggregation,
-        loss_matrix=loss_matrix,
+        load_balance_weight=load_balance_weight,
         dropout=dropout,
+        loss_matrix=loss_matrix,
     )
     
     return LacunaModel(config)
@@ -785,25 +625,13 @@ def create_lacuna_model(
 def create_lacuna_mini(
     max_cols: int = 32,
     mnar_variants: Optional[List[str]] = None,
+    use_missingness_features: bool = True,
 ) -> LacunaModel:
     """
     Create a minimal Lacuna model for testing and fast iteration.
-    
-    Smaller architecture suitable for:
-        - Unit tests
-        - Quick experiments
-        - CPU-only environments
-        - Debugging
-    
-    Args:
-        max_cols: Maximum number of columns.
-        mnar_variants: List of MNAR variant names.
-    
-    Returns:
-        Small LacunaModel instance.
     """
     if mnar_variants is None:
-        mnar_variants = ["self_censoring", "threshold"]  # Only 2 variants
+        mnar_variants = ["self_censoring", "threshold"]
     
     return create_lacuna_model(
         hidden_dim=64,
@@ -816,6 +644,7 @@ def create_lacuna_mini(
         recon_head_hidden_dim=32,
         recon_n_head_layers=1,
         mnar_variants=mnar_variants,
+        use_missingness_features=use_missingness_features,
         gate_hidden_dim=32,
         gate_n_layers=1,
         use_reconstruction_errors=True,
@@ -828,21 +657,10 @@ def create_lacuna_mini(
 def create_lacuna_base(
     max_cols: int = 32,
     mnar_variants: Optional[List[str]] = None,
+    use_missingness_features: bool = True,
 ) -> LacunaModel:
     """
     Create the standard Lacuna model configuration.
-    
-    Balanced architecture suitable for:
-        - Production use
-        - Full experiments
-        - GPU training
-    
-    Args:
-        max_cols: Maximum number of columns.
-        mnar_variants: List of MNAR variant names.
-    
-    Returns:
-        Standard LacunaModel instance.
     """
     return create_lacuna_model(
         hidden_dim=128,
@@ -855,6 +673,7 @@ def create_lacuna_base(
         recon_head_hidden_dim=64,
         recon_n_head_layers=2,
         mnar_variants=mnar_variants,
+        use_missingness_features=use_missingness_features,
         gate_hidden_dim=64,
         gate_n_layers=2,
         use_reconstruction_errors=True,
@@ -869,21 +688,10 @@ def create_lacuna_base(
 def create_lacuna_large(
     max_cols: int = 64,
     mnar_variants: Optional[List[str]] = None,
+    use_missingness_features: bool = True,
 ) -> LacunaModel:
     """
     Create a large Lacuna model for maximum accuracy.
-    
-    Larger architecture suitable for:
-        - Final production models
-        - When compute is not a constraint
-        - Complex datasets with many features
-    
-    Args:
-        max_cols: Maximum number of columns.
-        mnar_variants: List of MNAR variant names.
-    
-    Returns:
-        Large LacunaModel instance.
     """
     return create_lacuna_model(
         hidden_dim=256,
@@ -896,13 +704,14 @@ def create_lacuna_large(
         recon_head_hidden_dim=128,
         recon_n_head_layers=3,
         mnar_variants=mnar_variants,
+        use_missingness_features=use_missingness_features,
         gate_hidden_dim=128,
         gate_n_layers=3,
         use_reconstruction_errors=True,
         use_expert_heads=True,
         temperature=1.0,
         learn_temperature=True,
-        load_balance_weight=0.01,
         class_aggregation="mean",
+        load_balance_weight=0.01,
         dropout=0.1,
     )

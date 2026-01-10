@@ -1,61 +1,25 @@
 """
 lacuna.models.moe
 
-Mixture of Experts layer for mechanism classification.
+Mixture of Experts for mechanism classification.
 
-Architecture:
-    evidence [B, evidence_dim] + reconstruction_errors [B, n_heads]
-                            │
-                            ▼
-                    GatingNetwork (MLP)
-                            │
-                            ▼
-                gate_logits [B, n_experts]
-                            │
-                            ▼
-                softmax(logits / temperature)
-                            │
-                            ▼
-                gate_probs [B, n_experts]
-                            │
-                            ▼
-            get_class_posterior() with balanced aggregation
-                            │
-                            ▼
-                p_class [B, 3] (MCAR, MAR, MNAR)
+Enhanced with explicit missingness pattern features for better MAR/MCAR discrimination.
 
-Expert Structure:
-    - Expert 0: MCAR
-    - Expert 1: MAR
-    - Experts 2+: MNAR variants (self_censoring, threshold, latent, ...)
+The MoE receives three types of input signals:
+1. Evidence vector: Learned representation from transformer encoder
+2. Reconstruction errors: How well each head predicts missing values
+3. Missingness features: Explicit statistical features of missingness patterns
 
-CRITICAL FIX (2026-01-10):
---------------------------
-The original implementation summed expert probabilities to get class posteriors.
-With 1 MCAR expert, 1 MAR expert, and 3 MNAR experts, this creates a 3x prior
-toward MNAR (60% vs 20% vs 20% at initialization).
-
-The fix: Use NORMALIZED aggregation that averages expert probabilities per class
-before re-normalizing. This gives equal prior weight to each class regardless
-of how many experts represent it.
-
-    Old (biased):     p_class[MNAR] = sum(p[experts 2,3,4]) = 60%
-    New (balanced):   p_class[MNAR] = mean(p[experts 2,3,4]) / Z = 33%
-
-Components:
-    MoEConfig: Configuration dataclass
-    GatingNetwork: MLP that produces expert logits from evidence
-    ExpertHead: Optional per-expert refinement head
-    ExpertHeads: Container for all expert heads
-    MixtureOfExperts: Main MoE layer
-    RowToDatasetAggregator: For row-level gating (experimental)
-    Load balancing loss to prevent expert collapse (optional)
+The missingness features are critical for MCAR vs MAR discrimination:
+- MCAR: Low variance in missing rates, low cross-column correlation
+- MAR: High point-biserial correlations, structured missingness patterns
+- MNAR: Distributional distortions (skewness, kurtosis)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List, Dict, Tuple, Union
+from typing import Optional, List, Tuple, Dict
 from dataclasses import dataclass, field
 
 from lacuna.core.types import MoEOutput, MCAR, MAR, MNAR
@@ -70,40 +34,41 @@ class MoEConfig:
     """Configuration for Mixture of Experts layer."""
     
     # Input dimensions
-    evidence_dim: int = 64         # Dimension of dataset evidence vector
-    hidden_dim: int = 128          # Dimension of row representations (for row-level gating)
+    evidence_dim: int = 64
+    hidden_dim: int = 128
     
     # Expert structure
-    n_mechanism_classes: int = 3   # MCAR, MAR, MNAR (base classes)
-    mnar_variants: List[str] = None  # MNAR variant names
+    n_mechanism_classes: int = 3
+    mnar_variants: List[str] = None
     
     # Gating architecture
-    gate_hidden_dim: int = 64      # Hidden dimension in gating network
-    gate_n_layers: int = 2         # Depth of gating network
-    gate_dropout: float = 0.1      # Dropout in gating network
+    gate_hidden_dim: int = 64
+    gate_n_layers: int = 2
+    gate_dropout: float = 0.1
     
     # Gating mode
-    gating_level: str = "dataset"  # "dataset" or "row"
-    use_reconstruction_errors: bool = True  # Include recon errors in gate input
-    n_reconstruction_heads: int = 5  # Number of reconstruction heads (if used)
+    gating_level: str = "dataset"
+    use_reconstruction_errors: bool = True
+    n_reconstruction_heads: int = 5
+    
+    # Missingness pattern features (NEW)
+    use_missingness_features: bool = True
+    n_missingness_features: int = 16  # From MissingnessFeatureConfig.n_features
     
     # Expert heads
-    use_expert_heads: bool = False  # If False, pure gating (experts are identity)
-    expert_hidden_dim: int = 32    # Hidden dimension in expert heads
+    use_expert_heads: bool = False
+    expert_hidden_dim: int = 32
     
     # Calibration
-    temperature: float = 1.0       # Temperature for softmax calibration
-    learn_temperature: bool = False  # Learn temperature as parameter
+    temperature: float = 1.0
+    learn_temperature: bool = False
     
-    # Class aggregation method (NEW)
-    # "mean": Normalize by expert count per class (RECOMMENDED - removes structural bias)
-    # "sum": Original behavior (biased toward classes with more experts)
-    # "learned": Use learnable class-level bias correction
+    # Class aggregation
     class_aggregation: str = "mean"
     
     # Regularization
-    load_balance_weight: float = 0.0  # Weight for load balancing loss (0 = disabled)
-    entropy_weight: float = 0.0    # Weight for entropy regularization (0 = disabled)
+    load_balance_weight: float = 0.0
+    entropy_weight: float = 0.0
     
     def __post_init__(self):
         if self.mnar_variants is None:
@@ -113,14 +78,11 @@ class MoEConfig:
             raise ValueError(f"gating_level must be 'dataset' or 'row', got {self.gating_level}")
         
         if self.class_aggregation not in ("mean", "sum", "learned"):
-            raise ValueError(
-                f"class_aggregation must be 'mean', 'sum', or 'learned', "
-                f"got {self.class_aggregation}"
-            )
+            raise ValueError(f"class_aggregation must be 'mean', 'sum', or 'learned'")
     
     @property
     def n_experts(self) -> int:
-        """Total number of experts: MCAR + MAR + MNAR variants."""
+        """Total number of experts."""
         return 2 + len(self.mnar_variants)
     
     @property
@@ -132,8 +94,13 @@ class MoEConfig:
     def gate_input_dim(self) -> int:
         """Dimension of input to gating network."""
         base_dim = self.evidence_dim if self.gating_level == "dataset" else self.hidden_dim
+        
         if self.use_reconstruction_errors:
-            return base_dim + self.n_reconstruction_heads
+            base_dim += self.n_reconstruction_heads
+        
+        if self.use_missingness_features:
+            base_dim += self.n_missingness_features
+        
         return base_dim
 
 
@@ -145,14 +112,8 @@ class GatingNetwork(nn.Module):
     """
     Gating network that produces expert mixture weights.
     
-    Takes evidence (dataset-level) or row representations (row-level) and
-    outputs logits for each expert. Optionally incorporates reconstruction
-    errors as additional input features.
-    
-    Architecture:
-        [evidence_dim (+ n_recon_heads)] -> MLP -> [n_experts]
-    
-    The output logits are converted to probabilities via temperature-scaled softmax.
+    Takes evidence vector, reconstruction errors, and missingness features
+    to produce logits for each expert.
     """
     
     def __init__(self, config: MoEConfig):
@@ -173,14 +134,12 @@ class GatingNetwork(nn.Module):
             ])
             in_dim = config.gate_hidden_dim
         
-        # Final layer outputs expert logits
         layers.append(nn.Linear(in_dim, config.n_experts))
         
         self.mlp = nn.Sequential(*layers)
         
         # Temperature parameter
         if config.learn_temperature:
-            # Initialize log_temperature so that exp(log_temp) = config.temperature
             init_log_temp = torch.log(torch.tensor(config.temperature))
             self.log_temperature = nn.Parameter(init_log_temp)
         else:
@@ -193,32 +152,35 @@ class GatingNetwork(nn.Module):
     
     def forward(
         self,
-        evidence: torch.Tensor,                    # [B, evidence_dim] or [B, max_rows, hidden_dim]
-        reconstruction_errors: Optional[torch.Tensor] = None,  # [B, n_heads] or [B, max_rows, n_heads]
+        evidence: torch.Tensor,
+        reconstruction_errors: Optional[torch.Tensor] = None,
+        missingness_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute gating logits and probabilities.
         
         Args:
-            evidence: Evidence vector(s) from encoder.
-                     Dataset-level: [B, evidence_dim]
-                     Row-level: [B, max_rows, hidden_dim]
-            reconstruction_errors: Optional reconstruction errors per head.
-                                  Dataset-level: [B, n_heads]
-                                  Row-level: [B, max_rows, n_heads]
+            evidence: Evidence vector from encoder. [B, evidence_dim]
+            reconstruction_errors: Reconstruction errors per head. [B, n_heads]
+            missingness_features: Explicit missingness pattern features. [B, n_miss_features]
         
         Returns:
-            logits: Raw gating logits. Shape matches evidence batch dims + [n_experts]
-            probs: Gating probabilities (temperature-scaled softmax of logits).
+            logits: Raw gating logits. [B, n_experts]
+            probs: Gating probabilities. [B, n_experts]
         """
-        # Concatenate reconstruction errors if provided and configured
+        # Build gate input by concatenating available features
+        gate_inputs = [evidence]
+        
         if self.config.use_reconstruction_errors and reconstruction_errors is not None:
-            gate_input = torch.cat([evidence, reconstruction_errors], dim=-1)
-        else:
-            gate_input = evidence
+            gate_inputs.append(reconstruction_errors)
+        
+        if self.config.use_missingness_features and missingness_features is not None:
+            gate_inputs.append(missingness_features)
+        
+        gate_input = torch.cat(gate_inputs, dim=-1)
         
         # Compute logits
-        logits = self.mlp(gate_input)  # [..., n_experts]
+        logits = self.mlp(gate_input)
         
         # Temperature-scaled softmax
         probs = F.softmax(logits / self.temperature, dim=-1)
@@ -231,15 +193,7 @@ class GatingNetwork(nn.Module):
 # =============================================================================
 
 class ExpertHead(nn.Module):
-    """
-    Lightweight expert head for mechanism-specific refinement.
-    
-    Each expert takes the evidence/row representation and produces a scalar
-    adjustment to the gating logit. This allows experts to learn mechanism-specific
-    patterns that refine the base gating decision.
-    
-    In "pure gating" mode (use_expert_heads=False), these are not used.
-    """
+    """Lightweight expert head for mechanism-specific refinement."""
     
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -253,24 +207,11 @@ class ExpertHead(nn.Module):
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute expert adjustment.
-        
-        Args:
-            x: Input representation. Shape: [..., input_dim]
-        
-        Returns:
-            adjustment: Scalar adjustment. Shape: [...]
-        """
         return self.net(x).squeeze(-1)
 
 
 class ExpertHeads(nn.Module):
-    """
-    Container for all expert heads.
-    
-    Manages one head per expert (mechanism class / MNAR variant).
-    """
+    """Container for all expert heads."""
     
     def __init__(self, config: MoEConfig):
         super().__init__()
@@ -288,15 +229,6 @@ class ExpertHeads(nn.Module):
             )
     
     def forward(self, evidence: torch.Tensor) -> torch.Tensor:
-        """
-        Compute all expert adjustments.
-        
-        Args:
-            evidence: Input representation. Shape: [..., input_dim]
-        
-        Returns:
-            adjustments: Expert adjustments. Shape: [..., n_experts]
-        """
         adjustments = []
         for name in self.config.expert_names:
             adj = self.experts[name](evidence)
@@ -313,41 +245,10 @@ class MixtureOfExperts(nn.Module):
     """
     Mixture of Experts layer for mechanism classification.
     
-    Combines a gating network with optional expert heads to produce
-    mechanism posteriors. The gating network learns to recognize which
-    mechanism generated the data based on the evidence vector and
-    optionally reconstruction errors.
-    
-    Architecture:
-        evidence [B, evidence_dim]
-             │
-             ├──────────────────────────────┐
-             │                              │
-             ▼                              ▼
-        GatingNetwork                  ExpertHeads (optional)
-             │                              │
-             ▼                              ▼
-        gate_logits [B, n_experts]     expert_adj [B, n_experts]
-             │                              │
-             └──────────┬───────────────────┘
-                        │
-                        ▼
-                combined_logits = gate_logits + expert_adj
-                        │
-                        ▼
-                p(mechanism) = softmax(combined_logits / T)
-    
-    Attributes:
-        config: MoEConfig with architecture parameters.
-        gating: GatingNetwork that produces mixture weights.
-        experts: Optional ExpertHeads for mechanism-specific refinement.
-    
-    Example:
-        >>> config = MoEConfig(evidence_dim=64)
-        >>> moe = MixtureOfExperts(config)
-        >>> output = moe(evidence)
-        >>> output.gate_probs.shape
-        torch.Size([B, 5])  # 5 experts
+    Now receives three input signals:
+    1. evidence: Learned representation from encoder
+    2. reconstruction_errors: How well each head predicts missing values
+    3. missingness_features: Explicit statistical features of missingness patterns
     """
     
     def __init__(self, config: MoEConfig):
@@ -365,28 +266,25 @@ class MixtureOfExperts(nn.Module):
             self.experts = None
         
         # Mapping from expert index to mechanism class
-        # Experts 0, 1 are MCAR, MAR; rest are MNAR variants
         self.register_buffer(
             "expert_to_class",
             torch.tensor([MCAR, MAR] + [MNAR] * len(config.mnar_variants))
         )
         
-        # Precompute experts per class for efficient aggregation
+        # Precompute experts per class
         experts_per_class = torch.zeros(3)
         for expert_idx in range(config.n_experts):
             class_idx = self.expert_to_class[expert_idx].item()
             experts_per_class[class_idx] += 1
         self.register_buffer("experts_per_class", experts_per_class)
         
-        # Learnable class bias (for "learned" aggregation mode)
+        # Learnable class bias
         if config.class_aggregation == "learned":
-            # Initialize to counteract the expert count imbalance
-            # With 1 MCAR, 1 MAR, N MNAR experts: bias MNAR by -log(N)
             n_mnar = len(config.mnar_variants)
             init_bias = torch.tensor([
-                0.0,                                              # MCAR (1 expert)
-                0.0,                                              # MAR (1 expert)
-                -torch.log(torch.tensor(float(n_mnar))).item(),   # MNAR (n_mnar experts)
+                0.0,
+                0.0,
+                -torch.log(torch.tensor(float(n_mnar))).item(),
             ])
             self.class_bias = nn.Parameter(init_bias)
         else:
@@ -396,193 +294,104 @@ class MixtureOfExperts(nn.Module):
         self,
         evidence: torch.Tensor,
         reconstruction_errors: Optional[torch.Tensor] = None,
+        missingness_features: Optional[torch.Tensor] = None,
         row_mask: Optional[torch.Tensor] = None,
     ) -> MoEOutput:
         """
         Compute mechanism posterior via gated experts.
         
         Args:
-            evidence: Evidence vector(s) from encoder.
-                     Dataset-level: [B, evidence_dim]
-                     Row-level: [B, max_rows, hidden_dim]
-            reconstruction_errors: Optional reconstruction errors per head.
-                                  Dataset-level: [B, n_heads]
-                                  Row-level: [B, max_rows, n_heads]
-            row_mask: Optional mask for valid rows (row-level gating only).
-                     Shape: [B, max_rows]
+            evidence: Evidence vector from encoder. [B, evidence_dim]
+            reconstruction_errors: Reconstruction errors per head. [B, n_heads]
+            missingness_features: Explicit missingness pattern features. [B, n_miss_features]
+            row_mask: Optional mask for valid rows (row-level gating).
         
         Returns:
-            MoEOutput containing:
-                - gate_logits: Raw gating logits
-                - gate_probs: Gating probabilities (mechanism posterior)
-                - expert_outputs: Expert adjustments (if use_expert_heads)
-                - combined_output: Final combined logits
+            MoEOutput with gating probabilities and auxiliary info.
         """
-        # Get base gating logits
-        gate_logits, gate_probs = self.gating(evidence, reconstruction_errors)
+        # Compute gating probabilities
+        gate_logits, gate_probs = self.gating(
+            evidence,
+            reconstruction_errors=reconstruction_errors,
+            missingness_features=missingness_features,
+        )
         
-        # Apply expert refinement if configured
+        # Apply expert heads if configured
+        expert_adjustments = None
         if self.experts is not None:
-            expert_adj = self.experts(evidence)
-            combined_logits = gate_logits + expert_adj
-            combined_probs = F.softmax(combined_logits / self.gating.temperature, dim=-1)
-        else:
-            expert_adj = None
-            combined_logits = gate_logits
-            combined_probs = gate_probs
-        
-        # For row-level gating, aggregate to dataset level if needed
-        # (store row-level in expert_outputs for analysis)
+            expert_adjustments = self.experts(evidence)
+            combined_logits = gate_logits + expert_adjustments
+            gate_probs = F.softmax(combined_logits / self.gating.temperature, dim=-1)
         
         return MoEOutput(
             gate_logits=gate_logits,
-            gate_probs=combined_probs,
-            expert_outputs=[expert_adj] if expert_adj is not None else None,
-            combined_output=combined_logits,
+            gate_probs=gate_probs,
+            expert_outputs=[expert_adjustments] if expert_adjustments is not None else None,
+            combined_output=gate_logits if expert_adjustments is None else (gate_logits + expert_adjustments),
         )
     
-    def get_class_posterior(
-        self,
-        moe_output: MoEOutput,
-    ) -> torch.Tensor:
-        """
-        Aggregate expert posteriors into mechanism class posterior.
+    def _compute_load_balance_loss(self, gate_probs: torch.Tensor) -> torch.Tensor:
+        """Compute load balancing loss to encourage uniform expert usage."""
+        if self.config.load_balance_weight <= 0:
+            return torch.tensor(0.0, device=gate_probs.device)
         
-        Uses the configured aggregation method to combine expert probabilities
-        into class-level probabilities. The default "mean" method normalizes
-        by expert count to remove structural bias.
+        # Average probability per expert across batch
+        avg_probs = gate_probs.mean(dim=0)
         
-        Args:
-            moe_output: Output from forward().
+        # Target is uniform distribution
+        target = torch.ones_like(avg_probs) / self.config.n_experts
         
-        Returns:
-            p_class: Class posterior [B, 3] for MCAR, MAR, MNAR.
-        """
-        if self.config.class_aggregation == "sum":
-            return self._get_class_posterior_sum(moe_output)
-        elif self.config.class_aggregation == "mean":
-            return self._get_class_posterior_mean(moe_output)
-        elif self.config.class_aggregation == "learned":
-            return self._get_class_posterior_learned(moe_output)
-        else:
-            # Should never reach here due to config validation
-            raise ValueError(f"Unknown class_aggregation: {self.config.class_aggregation}")
+        # KL divergence from uniform
+        loss = F.kl_div(avg_probs.log(), target, reduction='sum')
+        
+        return self.config.load_balance_weight * loss
     
-    def _get_class_posterior_sum(
-        self,
-        moe_output: MoEOutput,
-    ) -> torch.Tensor:
+    def _compute_entropy(self, gate_probs: torch.Tensor) -> torch.Tensor:
+        """Compute entropy of gating distribution."""
+        log_probs = torch.log(gate_probs.clamp(min=1e-8))
+        entropy = -(gate_probs * log_probs).sum(dim=-1)
+        return entropy.mean()
+    
+    def get_class_posterior(self, output: MoEOutput) -> torch.Tensor:
         """
-        Original (biased) aggregation: sum expert probs per class.
+        Aggregate expert probabilities to class probabilities.
         
-        WARNING: This creates a prior bias toward classes with more experts.
-        With 1 MCAR, 1 MAR, 3 MNAR experts, initial priors are ~20/20/60%.
-        
-        Kept for backward compatibility and ablation studies.
+        Uses balanced aggregation by default to avoid MNAR bias.
         """
-        probs = moe_output.gate_probs
-        B = probs.shape[0]
-        device = probs.device
+        gate_probs = output.gate_probs
+        B = gate_probs.shape[0]
+        device = gate_probs.device
         
         p_class = torch.zeros(B, 3, device=device)
         
         for expert_idx in range(self.config.n_experts):
             class_idx = self.expert_to_class[expert_idx].item()
-            p_class[:, class_idx] += probs[:, expert_idx]
+            p_class[:, class_idx] += gate_probs[:, expert_idx]
+        
+        # Apply aggregation method
+        if self.config.class_aggregation == "mean":
+            # Normalize by number of experts per class
+            p_class = p_class / self.experts_per_class.unsqueeze(0).clamp(min=1)
+            p_class = p_class / p_class.sum(dim=-1, keepdim=True)
+        
+        elif self.config.class_aggregation == "learned":
+            # Apply learned bias correction
+            if self.class_bias is not None:
+                log_p = torch.log(p_class.clamp(min=1e-8)) + self.class_bias.unsqueeze(0)
+                p_class = F.softmax(log_p, dim=-1)
+        
+        # "sum" mode: just normalize to sum to 1
+        else:
+            p_class = p_class / p_class.sum(dim=-1, keepdim=True)
         
         return p_class
     
-    def _get_class_posterior_mean(
-        self,
-        moe_output: MoEOutput,
-    ) -> torch.Tensor:
-        """
-        Balanced aggregation: average expert probs per class, then re-normalize.
+    def get_mnar_variant_posterior(self, output: MoEOutput) -> torch.Tensor:
+        """Get posterior over MNAR variants (conditional on MNAR)."""
+        gate_probs = output.gate_probs
         
-        This removes the structural prior bias from having different numbers
-        of experts per class. Each class gets equal prior weight at initialization.
-        
-        Process:
-            1. Sum expert probs for each class
-            2. Divide by number of experts in that class (average)
-            3. Re-normalize so p_class sums to 1
-        
-        With 1 MCAR, 1 MAR, 3 MNAR experts and uniform 20% per expert:
-            - Sum:  MCAR=20%, MAR=20%, MNAR=60%
-            - Avg:  MCAR=20%, MAR=20%, MNAR=20%
-            - Norm: MCAR=33%, MAR=33%, MNAR=33%
-        """
-        probs = moe_output.gate_probs
-        B = probs.shape[0]
-        device = probs.device
-        
-        # Sum expert probs by class
-        p_class_sum = torch.zeros(B, 3, device=device)
-        for expert_idx in range(self.config.n_experts):
-            class_idx = self.expert_to_class[expert_idx].item()
-            p_class_sum[:, class_idx] += probs[:, expert_idx]
-        
-        # Average by number of experts per class
-        p_class_avg = p_class_sum / self.experts_per_class.unsqueeze(0).clamp(min=1.0)
-        
-        # Re-normalize to sum to 1
-        p_class = p_class_avg / p_class_avg.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        
-        return p_class
-    
-    def _get_class_posterior_learned(
-        self,
-        moe_output: MoEOutput,
-    ) -> torch.Tensor:
-        """
-        Learned aggregation: sum expert logits per class, add learned bias, softmax.
-        
-        Uses logsumexp for numerical stability when aggregating logits.
-        The learnable class_bias allows the model to learn the optimal
-        prior correction during training.
-        """
-        gate_logits = moe_output.combined_output
-        B = gate_logits.shape[0]
-        device = gate_logits.device
-        
-        # Aggregate logits by class using logsumexp
-        # logsumexp(a, b) = log(exp(a) + exp(b)) - equivalent to summing probs in log space
-        class_logits = torch.full((B, 3), float('-inf'), device=device)
-        
-        for expert_idx in range(self.config.n_experts):
-            class_idx = self.expert_to_class[expert_idx].item()
-            expert_logit = gate_logits[:, expert_idx:expert_idx+1]
-            class_logits[:, class_idx:class_idx+1] = torch.logaddexp(
-                class_logits[:, class_idx:class_idx+1],
-                expert_logit,
-            )
-        
-        # Add learned bias correction
-        corrected_logits = class_logits + self.class_bias.unsqueeze(0)
-        
-        # Softmax to get class posteriors
-        p_class = F.softmax(corrected_logits, dim=-1)
-        
-        return p_class
-    
-    def get_mnar_variant_posterior(
-        self,
-        moe_output: MoEOutput,
-    ) -> torch.Tensor:
-        """
-        Extract MNAR variant posterior (conditioned on MNAR).
-        
-        Args:
-            moe_output: Output from forward().
-        
-        Returns:
-            p_variant: Posterior over MNAR variants [B, n_variants].
-                      Sums to 1 (conditional distribution given MNAR).
-        """
-        probs = moe_output.gate_probs
-        
-        # MNAR experts start at index 2
-        mnar_probs = probs[:, 2:]  # [B, n_variants]
+        # Extract MNAR expert probabilities (indices 2+)
+        mnar_probs = gate_probs[:, 2:]
         
         # Normalize to get conditional distribution
         mnar_total = mnar_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -590,92 +399,15 @@ class MixtureOfExperts(nn.Module):
         
         return p_variant
     
-    def compute_load_balance_loss(
-        self,
-        moe_output: MoEOutput,
-    ) -> torch.Tensor:
-        """
-        Compute load balancing loss for MoE.
-        
-        Encourages uniform usage of experts across the batch.
-        From Switch Transformer: n_experts * sum(f_i * p_i)
-        where f_i = fraction of batch routed to expert i
-              p_i = average probability assigned to expert i
-        
-        Minimize this to encourage uniform expert usage.
-        
-        Args:
-            moe_output: Output from forward().
-        
-        Returns:
-            loss: Load balance loss (scalar).
-        """
-        probs = moe_output.gate_probs  # [B, n_experts]
-        n_experts = self.config.n_experts
-        
-        # Average probability per expert
-        avg_prob = probs.mean(dim=0)  # [n_experts]
-        
-        # Fraction routed to each expert (hard assignment)
-        assignments = probs.argmax(dim=-1)  # [B]
-        fractions = torch.zeros(n_experts, device=probs.device)
-        for i in range(n_experts):
-            fractions[i] = (assignments == i).float().mean()
-        
-        # Load balance loss
-        loss = n_experts * (avg_prob * fractions).sum()
-        
-        return loss
-    
-    def compute_entropy_loss(
-        self,
-        moe_output: MoEOutput,
-    ) -> torch.Tensor:
-        """
-        Compute entropy loss for regularization.
-        
-        Returns negative entropy (so minimizing this maximizes entropy,
-        encouraging more uniform predictions when entropy_weight > 0).
-        
-        Args:
-            moe_output: Output from forward().
-        
-        Returns:
-            loss: Negative mean entropy (scalar).
-        """
-        probs = moe_output.gate_probs  # [B, n_experts]
-        
-        # Entropy per sample
-        log_probs = torch.log(probs.clamp(min=1e-8))
-        entropy = -(probs * log_probs).sum(dim=-1)  # [B]
-        
-        # Return negative mean entropy (minimizing this maximizes entropy)
-        return -entropy.mean()
-    
-    def get_auxiliary_losses(
-        self,
-        moe_output: MoEOutput,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute all auxiliary losses for MoE training.
-        
-        Args:
-            moe_output: Output from forward().
-        
-        Returns:
-            Dict with loss names and values.
-        """
+    def get_auxiliary_losses(self, output: MoEOutput) -> Dict[str, torch.Tensor]:
+        """Get auxiliary losses for training."""
         losses = {}
         
         if self.config.load_balance_weight > 0:
-            losses["load_balance"] = (
-                self.config.load_balance_weight * self.compute_load_balance_loss(moe_output)
-            )
+            losses["load_balance"] = self._compute_load_balance_loss(output.gate_probs)
         
-        if self.config.entropy_weight != 0:
-            losses["entropy"] = (
-                self.config.entropy_weight * self.compute_entropy_loss(moe_output)
-            )
+        if self.config.entropy_weight > 0:
+            losses["entropy"] = self.config.entropy_weight * self._compute_entropy(output.gate_probs)
         
         return losses
 
@@ -685,80 +417,48 @@ class MixtureOfExperts(nn.Module):
 # =============================================================================
 
 class RowToDatasetAggregator(nn.Module):
-    """
-    Aggregates row-level MoE outputs to dataset-level.
+    """Aggregate row-level gating decisions to dataset-level."""
     
-    When using row-level gating, this module combines the per-row mechanism
-    posteriors into a single dataset-level posterior.
-    
-    Aggregation methods:
-        - "mean": Simple average across rows
-        - "attention": Learned attention-weighted average
-        - "max": Max pooling (take most confident prediction)
-    """
-    
-    def __init__(
-        self,
-        n_experts: int,
-        hidden_dim: int,
-        method: str = "attention",
-        dropout: float = 0.1,
-    ):
+    def __init__(self, hidden_dim: int, n_experts: int, dropout: float = 0.1):
         super().__init__()
         
-        self.method = method
-        self.n_experts = n_experts
-        
-        if method == "attention":
-            # Attention over rows, conditioned on row gating
-            self.attention = nn.Sequential(
-                nn.Linear(n_experts, hidden_dim // 2),
-                nn.Tanh(),
-                nn.Linear(hidden_dim // 2, 1),
-            )
-            self.dropout = nn.Dropout(dropout)
-        elif method not in ("mean", "max"):
-            raise ValueError(f"Unknown aggregation method: {method}")
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
     
     def forward(
         self,
-        row_probs: torch.Tensor,   # [B, max_rows, n_experts]
-        row_mask: torch.Tensor,     # [B, max_rows]
+        row_logits: torch.Tensor,
+        row_repr: torch.Tensor,
+        row_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Aggregate row-level probabilities to dataset level.
+        Aggregate row-level logits to dataset-level.
         
         Args:
-            row_probs: Row-level mechanism posteriors.
-            row_mask: Valid row mask.
+            row_logits: [B, max_rows, n_experts]
+            row_repr: [B, max_rows, hidden_dim]
+            row_mask: [B, max_rows]
         
         Returns:
-            dataset_probs: Dataset-level posterior. Shape: [B, n_experts]
+            dataset_logits: [B, n_experts]
         """
-        # Expand mask for broadcasting
-        mask = row_mask.unsqueeze(-1)  # [B, max_rows, 1]
+        # Compute attention weights
+        attn_scores = self.attention(row_repr).squeeze(-1)
         
-        if self.method == "mean":
-            # Masked mean
-            masked_probs = row_probs * mask.float()
-            sum_probs = masked_probs.sum(dim=1)  # [B, n_experts]
-            count = row_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)
-            dataset_probs = sum_probs / count
+        # Mask invalid rows
+        mask_value = torch.finfo(attn_scores.dtype).min
+        attn_scores = attn_scores.masked_fill(~row_mask, mask_value)
         
-        elif self.method == "max":
-            # Masked max (take row with highest max probability)
-            masked_probs = row_probs.masked_fill(~mask, float('-inf'))
-            dataset_probs, _ = masked_probs.max(dim=1)
+        # Softmax
+        attn_weights = F.softmax(attn_scores, dim=-1)
         
-        elif self.method == "attention":
-            # Attention-weighted average
-            scores = self.attention(row_probs).squeeze(-1)  # [B, max_rows]
-            scores = scores.masked_fill(~row_mask, float('-inf'))
-            weights = F.softmax(scores, dim=-1)  # [B, max_rows]
-            weights = self.dropout(weights)
-            dataset_probs = torch.einsum("br,bre->be", weights, row_probs)
+        # Weighted average
+        dataset_logits = torch.einsum('br,bre->be', attn_weights, row_logits)
         
-        return dataset_probs
+        return dataset_logits
 
 
 # =============================================================================
@@ -774,6 +474,8 @@ def create_moe(
     gating_level: str = "dataset",
     use_reconstruction_errors: bool = True,
     n_reconstruction_heads: int = 5,
+    use_missingness_features: bool = True,
+    n_missingness_features: int = 16,
     use_expert_heads: bool = False,
     temperature: float = 1.0,
     learn_temperature: bool = False,
@@ -782,35 +484,8 @@ def create_moe(
     entropy_weight: float = 0.0,
     dropout: float = 0.1,
 ) -> MixtureOfExperts:
-    """
-    Factory function to create a MixtureOfExperts layer.
+    """Factory function to create MixtureOfExperts."""
     
-    Args:
-        evidence_dim: Dimension of dataset evidence vector.
-        hidden_dim: Dimension of row representations (for row-level gating).
-        mnar_variants: List of MNAR variant names.
-        gate_hidden_dim: Hidden dimension in gating network.
-        gate_n_layers: Depth of gating network.
-        gating_level: "dataset" or "row".
-        use_reconstruction_errors: Include reconstruction errors in gate input.
-        n_reconstruction_heads: Number of reconstruction heads.
-        use_expert_heads: Use expert refinement heads.
-        temperature: Temperature for softmax calibration.
-        learn_temperature: Learn temperature as parameter.
-        class_aggregation: Method for aggregating expert probs to class probs.
-                          "mean" (default, balanced), "sum" (biased), or "learned".
-        load_balance_weight: Weight for load balancing loss.
-        entropy_weight: Weight for entropy regularization.
-        dropout: Dropout probability.
-    
-    Returns:
-        Configured MixtureOfExperts instance.
-    
-    Example:
-        >>> moe = create_moe(evidence_dim=64, use_reconstruction_errors=True)
-        >>> output = moe(evidence, reconstruction_errors)
-        >>> p_class = moe.get_class_posterior(output)
-    """
     if mnar_variants is None:
         mnar_variants = ["self_censoring", "threshold", "latent"]
     
@@ -824,6 +499,8 @@ def create_moe(
         gating_level=gating_level,
         use_reconstruction_errors=use_reconstruction_errors,
         n_reconstruction_heads=n_reconstruction_heads,
+        use_missingness_features=use_missingness_features,
+        n_missingness_features=n_missingness_features,
         use_expert_heads=use_expert_heads,
         temperature=temperature,
         learn_temperature=learn_temperature,

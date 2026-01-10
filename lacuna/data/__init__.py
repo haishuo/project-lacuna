@@ -96,6 +96,12 @@ from lacuna.data.catalog import (
     DEFAULT_PROCESSED_DIR,
 )
 
+from lacuna.data.missingness_features import (
+       extract_missingness_features,
+       MissingnessFeatureExtractor,
+       MissingnessFeatureConfig,
+       get_feature_names,
+   )
 
 __all__ = [
     # === Core Types ===
