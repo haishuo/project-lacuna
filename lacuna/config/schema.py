@@ -7,17 +7,24 @@ Simplified for row-level tokenization architecture.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import torch
 
 
 @dataclass
 class DataConfig:
     """Data processing configuration."""
+    # Synthetic data ranges (used by SyntheticDataLoader)
     n_range: Tuple[int, int] = (50, 500)
     d_range: Tuple[int, int] = (3, 20)
+    
+    # Dimension limits
     max_cols: int = 32
     max_rows: int = 256
+    
+    # Semi-synthetic dataset names (used by SemiSyntheticDataLoader)
+    train_datasets: Optional[List[str]] = None
+    val_datasets: Optional[List[str]] = None
     
     def __post_init__(self):
         if self.n_range[0] > self.n_range[1]:

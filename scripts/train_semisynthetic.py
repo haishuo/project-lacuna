@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from lacuna.config import LacunaConfig
+from lacuna.config import LacunaConfig, load_config, config_to_dict
 from lacuna.models import LacunaModel
 from lacuna.generators import create_minimal_registry
 from lacuna.generators.priors import GeneratorPrior
@@ -67,7 +67,7 @@ def main():
     
     # Load config
     print(f"\nLoading config: {args.config}")
-    config = LacunaConfig.from_yaml(args.config)
+    config = load_config(args.config)
     
     # Create experiment directory
     exp_name = args.name or f"semisyn_{int(time.time())}"
@@ -77,7 +77,7 @@ def main():
     
     # Save config
     with open(exp_dir / "config.yaml", "w") as f:
-        yaml.dump(config.to_dict(), f)
+        yaml.dump(config_to_dict(config), f)
     
     # Print configuration
     print(f"\nConfiguration:")

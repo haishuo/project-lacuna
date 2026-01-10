@@ -7,6 +7,7 @@ Exports:
 - Loss functions
 - Trainer
 - Checkpointing
+- Logging
 """
 
 from .loss import (
@@ -32,6 +33,10 @@ from .checkpoint import (
     CHECKPOINT_VERSION,
 )
 
+from .logging import (
+    create_logger,
+)
+
 __all__ = [
     # Loss
     "generator_cross_entropy",
@@ -50,4 +55,6 @@ __all__ = [
     "load_model_from_checkpoint",
     "load_trainer_from_checkpoint",
     "CHECKPOINT_VERSION",
+    # Logging
+    "create_logger",
 ]

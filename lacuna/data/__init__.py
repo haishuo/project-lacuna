@@ -33,6 +33,34 @@ from .batching import (
     SyntheticDataLoader,
 )
 
+# Ingestion (loading external data)
+from .ingestion import (
+    RawDataset,
+    load_csv,
+    load_parquet,
+    load_sklearn_dataset,
+    load_from_url,
+)
+
+# Semi-synthetic data generation
+from .semisynthetic import (
+    SemiSyntheticDataset,
+    apply_missingness,
+    subsample_rows,
+    generate_semisynthetic_batch,
+    SemiSyntheticDataLoader,
+    MixedDataLoader,
+)
+
+# Dataset catalog
+from .catalog import (
+    DatasetInfo,
+    DatasetCatalog,
+    create_default_catalog,
+    DEFAULT_RAW_DIR,
+    DEFAULT_PROCESSED_DIR,
+)
+
 __all__ = [
     # Observed
     "create_observed_dataset",
@@ -47,16 +75,23 @@ __all__ = [
     "tokenize_and_batch",
     "collate_fn",
     "SyntheticDataLoader",
+    # Ingestion
+    "RawDataset",
+    "load_csv",
+    "load_parquet",
+    "load_sklearn_dataset",
+    "load_from_url",
+    # Semi-synthetic
+    "SemiSyntheticDataset",
+    "apply_missingness",
+    "subsample_rows",
+    "generate_semisynthetic_batch",
+    "SemiSyntheticDataLoader",
+    "MixedDataLoader",
+    # Catalog
+    "DatasetInfo",
+    "DatasetCatalog",
+    "create_default_catalog",
+    "DEFAULT_RAW_DIR",
+    "DEFAULT_PROCESSED_DIR",
 ]
-
-# Catalog imports (if not already present)
-try:
-    from .catalog import (
-        DatasetInfo,
-        DatasetCatalog,
-        create_default_catalog,
-        DEFAULT_RAW_DIR,
-        DEFAULT_PROCESSED_DIR,
-    )
-except ImportError:
-    pass

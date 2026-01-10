@@ -26,7 +26,7 @@ from lacuna.generators import create_minimal_registry, GeneratorPrior
 from lacuna.data.batching import SyntheticDataLoader
 from lacuna.models.assembly import LacunaModel
 from lacuna.training.trainer import Trainer, TrainerConfig
-from lacuna.training.checkpoint import save_checkpoint, CheckpointData
+from lacuna.training import save_checkpoint, CheckpointData, create_logger
 
 
 def parse_args():
@@ -54,29 +54,6 @@ def setup_experiment(config: LacunaConfig, name: str = None) -> Path:
     return output_dir
 
 
-def create_logger(output_dir: Path):
-    """Create logging function."""
-    log_file = output_dir / "logs" / "training.log"
-    
-    def log(metrics: dict):
-        step = metrics.get("step", metrics.get("epoch", "?"))
-        
-        if "val_loss" in metrics:
-            print(f"  Epoch {metrics.get('epoch', '?'):3d} | "
-                  f"train_loss: {metrics.get('train_loss', 0):.4f} | "
-                  f"val_loss: {metrics['val_loss']:.4f} | "
-                  f"val_acc_gen: {metrics.get('val_acc_generator', 0)*100:.1f}% | "
-                  f"val_acc_cls: {metrics.get('val_acc_class', 0)*100:.1f}%")
-        elif "loss_total" in metrics and metrics.get("step", 0) % 50 == 0:
-            print(f"  Step {step:5d} | "
-                  f"loss: {metrics['loss_total']:.4f} | "
-                  f"acc_gen: {metrics.get('acc_generator', 0)*100:.1f}% | "
-                  f"lr: {metrics.get('lr', 0):.2e}")
-        
-        with open(log_file, "a") as f:
-            f.write(f"{metrics}\n")
-    
-    return log
 
 
 def main():

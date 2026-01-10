@@ -1,0 +1,62 @@
+# Semi-synthetic training with all 27 downloaded datasets
+seed: 42
+device: cuda
+output_dir: /mnt/artifacts/project_lacuna/runs
+
+data:
+  max_rows: 128
+  max_cols: 82  # For superconductor (82 features)
+  train_datasets:
+    # Large (7)
+    - credit_card_default
+    - superconductor
+    - letter_recognition
+    - magic_telescope
+    - avocado_prices
+    - bike_sharing
+    - pendigits
+    # Medium (13)
+    - pulsar_stars
+    - wine_quality_red
+    - satellite
+    - optical_digits
+    - page_blocks
+    - wine_white
+    - spambase
+    - abalone
+    - cardiotocography
+    - steel_plates
+    - yeast
+    - banknote
+    - concrete
+    # Small (6) - leave one for validation
+    - vehicle
+    - ionosphere
+    - ecoli
+    - glass
+    - parkinsons
+    - heart_disease
+  val_datasets:
+    - segmentation  # Hold out for validation
+
+model:
+  hidden_dim: 128
+  evidence_dim: 64
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+training:
+  epochs: 30
+  batch_size: 64
+  batches_per_epoch: 50
+  val_batches: 10
+  lr: 0.0003
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_steps: 100
+  patience: 10
+  min_delta: 0.001
+
+generator:
+  n_generators: 6
