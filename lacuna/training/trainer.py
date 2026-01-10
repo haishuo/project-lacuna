@@ -521,9 +521,16 @@ class Trainer:
         
         return metrics
     
-    def _check_early_stopping(self, val_metrics: Dict[str, float]) -> bool:
+# In lacuna/training/trainer.py, replace the _check_early_stopping method with this:
+
+    def _check_early_stopping(
+        self,
+        val_metrics: Dict[str, float],
+    ) -> bool:
         """
-        Check early stopping criteria.
+        Check if training should stop early.
+        
+        Updates best metrics and patience counter based on validation results.
         
         Args:
             val_metrics: Validation metrics from validate().
@@ -531,17 +538,25 @@ class Trainer:
         Returns:
             True if training should stop, False otherwise.
         """
-        metric = val_metrics.get(self.config.early_stop_metric, val_metrics["val_loss"])
+        val_loss = val_metrics.get("val_loss", float("inf"))
+        val_acc = val_metrics.get("val_acc", 0.0)
         
-        # Check if improved
+        # Always track best of both metrics (regardless of which is used for early stopping)
+        loss_improved = val_loss < (self.state.best_val_loss - self.config.min_delta)
+        acc_improved = val_acc > (self.state.best_val_acc + self.config.min_delta)
+        
+        if loss_improved:
+            self.state.best_val_loss = val_loss
+        if acc_improved:
+            self.state.best_val_acc = val_acc
+        
+        # Determine if the tracked metric improved (for early stopping decision)
         if self.config.early_stop_mode == "min":
-            improved = metric < (self.state.best_val_loss - self.config.min_delta)
-            if improved:
-                self.state.best_val_loss = metric
+            metric = val_metrics.get(self.config.early_stop_metric, val_loss)
+            improved = metric < (self.state.best_val_loss + self.config.min_delta)
         else:  # max
-            improved = metric > (self.state.best_val_acc + self.config.min_delta)
-            if improved:
-                self.state.best_val_acc = metric
+            metric = val_metrics.get(self.config.early_stop_metric, val_acc)
+            improved = metric > (self.state.best_val_acc - self.config.min_delta)
         
         if improved:
             self.state.patience_counter = 0
@@ -553,7 +568,7 @@ class Trainer:
             if self.state.patience_counter >= self.config.patience:
                 return True
             return False
-    
+
     def _save_checkpoint(
         self,
         val_metrics: Dict[str, float],

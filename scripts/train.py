@@ -23,8 +23,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from lacuna.config.schema import LacunaConfig
 from lacuna.config.load import load_config, save_config
 from lacuna.generators import create_minimal_registry, GeneratorPrior
-from lacuna.data.batching import SyntheticDataLoader
-from lacuna.models.assembly import LacunaModel
+from lacuna.data.batching import SyntheticDataLoader, SyntheticDataLoaderConfig
+from lacuna.models.assembly import LacunaModel, create_lacuna_model
 from lacuna.training.trainer import Trainer, TrainerConfig
 from lacuna.training import save_checkpoint, CheckpointData, create_logger
 
@@ -54,8 +54,6 @@ def setup_experiment(config: LacunaConfig, name: str = None) -> Path:
     return output_dir
 
 
-
-
 def main():
     args = parse_args()
     
@@ -82,13 +80,19 @@ def main():
     # Save config
     save_config(config, exp_dir / "config.yaml")
     
+    # Cap n_range to max_rows to prevent shape mismatch in tokenization
+    capped_n_range = (
+        min(config.data.n_range[0], config.data.max_rows),
+        min(config.data.n_range[1], config.data.max_rows),
+    )
+    
     # Print config summary
     print(f"\nConfiguration:")
     print(f"  Device: {config.device}")
     print(f"  Seed: {config.seed}")
     print(f"  Model: hidden={config.model.hidden_dim}, layers={config.model.n_layers}, heads={config.model.n_heads}")
     print(f"  Training: epochs={config.training.epochs}, lr={config.training.lr}, batch={config.training.batch_size}")
-    print(f"  Data: n_range={config.data.n_range}, d_range={config.data.d_range}")
+    print(f"  Data: n_range={capped_n_range}, d_range={config.data.d_range}")
     print(f"  Data: max_rows={config.data.max_rows}, max_cols={config.data.max_cols}")
     print(f"  Generators: K={config.generator.n_generators}")
     
@@ -108,42 +112,48 @@ def main():
     print(f"  Generators: {registry.K}")
     print(f"  Class distribution: {registry.class_counts()}")
     
-    # Create prior
-    prior = GeneratorPrior.uniform(registry)
+    # Extract generators tuple from registry
+    generators = registry.generators
     
-    # Create data loaders
-    print("\nCreating data loaders...")
-    train_loader = SyntheticDataLoader(
-        registry=registry,
-        prior=prior,
-        n_range=config.data.n_range,
+    # Create data loader configs
+    train_loader_config = SyntheticDataLoaderConfig(
+        batch_size=config.training.batch_size,
+        n_range=capped_n_range,
         d_range=config.data.d_range,
         max_rows=config.data.max_rows,
         max_cols=config.data.max_cols,
-        batch_size=config.training.batch_size,
         batches_per_epoch=config.training.batches_per_epoch,
         seed=config.seed,
     )
     
-    val_loader = SyntheticDataLoader(
-        registry=registry,
-        prior=prior,
-        n_range=config.data.n_range,
+    val_loader_config = SyntheticDataLoaderConfig(
+        batch_size=config.training.batch_size,
+        n_range=capped_n_range,
         d_range=config.data.d_range,
         max_rows=config.data.max_rows,
         max_cols=config.data.max_cols,
-        batch_size=config.training.batch_size,
         batches_per_epoch=config.training.val_batches,
         seed=config.seed + 1000000,
     )
     
+    # Create data loaders
+    print("\nCreating data loaders...")
+    train_loader = SyntheticDataLoader(generators, train_loader_config)
+    val_loader = SyntheticDataLoader(generators, val_loader_config)
+    
     print(f"  Train: {len(train_loader)} batches/epoch")
     print(f"  Val: {len(val_loader)} batches")
     
-    # Create model
+    # Create model using factory function
     print("\nCreating model...")
-    class_mapping = registry.get_class_mapping()
-    model = LacunaModel.from_config(config, class_mapping)
+    model = create_lacuna_model(
+        hidden_dim=config.model.hidden_dim,
+        evidence_dim=config.model.evidence_dim,
+        n_layers=config.model.n_layers,
+        n_heads=config.model.n_heads,
+        max_cols=config.data.max_cols,
+        dropout=config.model.dropout,
+    )
     
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -163,10 +173,10 @@ def main():
         save_best_only=True,
     )
     
-    trainer = Trainer(model, trainer_config, device=config.device)
-    trainer.set_logger(create_logger(exp_dir))
+    logger = create_logger(exp_dir)
+    trainer = Trainer(model, trainer_config, device=config.device, log_fn=logger)
     
-    # Train
+    # Train!
     print("\n" + "=" * 60)
     print("TRAINING")
     print("=" * 60)
@@ -179,19 +189,24 @@ def main():
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
-    print(f"  Epochs completed: {result['epochs_completed']}")
+    print(f"  Epochs completed: {result['final_epoch'] + 1}")
     print(f"  Total steps: {result['total_steps']}")
     print(f"  Best val loss: {result['best_val_loss']:.4f}")
-    print(f"  Best val acc (generator): {result['best_val_acc']*100:.1f}%")
+    print(f"  Best val acc: {result['best_val_acc']*100:.1f}%")
     print(f"  Training time: {total_time:.1f}s ({total_time/60:.1f}m)")
     
-    # Save final checkpoint
+    # Save final checkpoint using CheckpointData's actual API
+    # CheckpointData uses 'metrics' not 'metadata'
     final_ckpt = CheckpointData(
         model_state=model.state_dict(),
         step=result['total_steps'],
-        epoch=result['epochs_completed'],
+        epoch=result['final_epoch'],
         best_val_loss=result['best_val_loss'],
-        metadata={"training_time": total_time, "best_val_acc": result['best_val_acc']},
+        best_val_acc=result['best_val_acc'],
+        metrics={
+            "training_time": total_time,
+            "data_mode": "synthetic",
+        },
     )
     save_checkpoint(final_ckpt, exp_dir / "checkpoints" / "final.pt")
     

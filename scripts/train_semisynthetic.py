@@ -6,17 +6,24 @@ Uses real datasets with synthetic missingness mechanisms.
 
 Usage:
     python scripts/train_semisynthetic.py --config configs/training/semisynthetic.yaml
+    python scripts/train_semisynthetic.py --config configs/training/semisynthetic_minimal.yaml --device cuda
     python scripts/train_semisynthetic.py --config configs/training/semisynthetic.yaml --name my_experiment
 """
 
 import argparse
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
-import torch
-import yaml
 
-from lacuna.config import LacunaConfig, load_config, config_to_dict
-from lacuna.models import LacunaModel
+import torch
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from lacuna.config import LacunaConfig, load_config, save_config
+from lacuna.models import create_lacuna_model
 from lacuna.generators import create_minimal_registry
 from lacuna.generators.priors import GeneratorPrior
 from lacuna.data import (
@@ -30,6 +37,30 @@ from lacuna.training import (
     save_checkpoint,
     create_logger,
 )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Lacuna on semi-synthetic data")
+    parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
+    parser.add_argument("--name", type=str, default=None, help="Experiment name")
+    parser.add_argument("--device", type=str, default=None, help="Override device (cpu/cuda)")
+    parser.add_argument("--seed", type=int, default=None, help="Override random seed")
+    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
+    return parser.parse_args()
+
+
+def setup_experiment(config: LacunaConfig, name: str = None) -> Path:
+    """Create experiment directory with timestamp."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_name = name or f"lacuna_semisyn_{timestamp}"
+    
+    output_dir = Path(config.output_dir) / exp_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    (output_dir / "checkpoints").mkdir(exist_ok=True)
+    (output_dir / "logs").mkdir(exist_ok=True)
+    
+    return output_dir
 
 
 def load_raw_datasets(catalog, dataset_names: list, max_cols: int):
@@ -55,11 +86,7 @@ def load_raw_datasets(catalog, dataset_names: list, max_cols: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Lacuna on semi-synthetic data")
-    parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
-    parser.add_argument("--name", type=str, default=None, help="Experiment name")
-    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
-    args = parser.parse_args()
+    args = parse_args()
     
     print("=" * 60)
     print("LACUNA TRAINING (Semi-Synthetic)")
@@ -69,17 +96,20 @@ def main():
     print(f"\nLoading config: {args.config}")
     config = load_config(args.config)
     
-    # Create experiment directory
-    exp_name = args.name or f"semisyn_{int(time.time())}"
-    exp_dir = Path(config.output_dir) / exp_name
-    exp_dir.mkdir(parents=True, exist_ok=True)
+    # Apply overrides
+    if args.device:
+        config.device = args.device
+    if args.seed:
+        config.seed = args.seed
+    
+    # Setup experiment
+    exp_dir = setup_experiment(config, args.name)
     print(f"Experiment directory: {exp_dir}")
     
     # Save config
-    with open(exp_dir / "config.yaml", "w") as f:
-        yaml.dump(config_to_dict(config), f)
+    save_config(config, exp_dir / "config.yaml")
     
-    # Print configuration
+    # Print config summary
     print(f"\nConfiguration:")
     print(f"  Device: {config.device}")
     print(f"  Seed: {config.seed}")
@@ -87,42 +117,31 @@ def main():
     print(f"  Training: epochs={config.training.epochs}, lr={config.training.lr}, batch={config.training.batch_size}")
     print(f"  Data: max_rows={config.data.max_rows}, max_cols={config.data.max_cols}")
     
-    # Check device
-    if config.device == "cuda" and not torch.cuda.is_available():
-        print("\nWarning: CUDA not available, falling back to CPU")
-        config.device = "cpu"
-    
     # Set seed
     print(f"\nSetting seed: {config.seed}")
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.seed)
     
-    # Create registry
+    # Create generator registry
     print("\nCreating generator registry...")
     registry = create_minimal_registry()
+    prior = GeneratorPrior.uniform(registry)
     print(f"  Generators: {registry.K}")
     print(f"  Class distribution: {registry.class_counts()}")
     
-    prior = GeneratorPrior.uniform(registry)
-    
     # Load datasets
-    print("\nLoading datasets from catalog...")
+    print("\nLoading datasets...")
     catalog = create_default_catalog()
     
-    # Get dataset names from config or use defaults
-    train_datasets = getattr(config.data, 'train_datasets', None) or [
-        "breast_cancer", "diabetes", "wine"
-    ]
-    val_datasets = getattr(config.data, 'val_datasets', None) or [
-        "iris"  # Hold out for validation
-    ]
+    train_dataset_names = config.data.train_datasets or ["diabetes", "wine", "breast_cancer"]
+    val_dataset_names = config.data.val_datasets or ["iris"]
     
     print("  Training datasets:")
-    train_raw = load_raw_datasets(catalog, train_datasets, config.data.max_cols)
+    train_raw = load_raw_datasets(catalog, train_dataset_names, config.data.max_cols)
     
     print("  Validation datasets:")
-    val_raw = load_raw_datasets(catalog, val_datasets, config.data.max_cols)
+    val_raw = load_raw_datasets(catalog, val_dataset_names, config.data.max_cols)
     
     if len(train_raw) == 0:
         print("\nError: No training datasets loaded. Exiting.")
@@ -160,10 +179,16 @@ def main():
     print(f"  Train: {len(train_loader)} batches/epoch")
     print(f"  Val: {len(val_loader)} batches")
     
-    # Create model
+    # Create model using factory function
     print("\nCreating model...")
-    class_mapping = registry.get_class_mapping()
-    model = LacunaModel.from_config(config, class_mapping)
+    model = create_lacuna_model(
+        hidden_dim=config.model.hidden_dim,
+        evidence_dim=config.model.evidence_dim,
+        n_layers=config.model.n_layers,
+        n_heads=config.model.n_heads,
+        max_cols=config.data.max_cols,
+        dropout=config.model.dropout,
+    )
     
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -183,8 +208,8 @@ def main():
         save_best_only=True,
     )
     
-    trainer = Trainer(model, trainer_config, device=config.device)
-    trainer.set_logger(create_logger(exp_dir))
+    logger = create_logger(exp_dir)
+    trainer = Trainer(model, trainer_config, device=config.device, log_fn=logger)
     
     # Train!
     print("\n" + "=" * 60)
@@ -199,21 +224,21 @@ def main():
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
-    print(f"  Epochs completed: {result['epochs_completed']}")
+    print(f"  Epochs completed: {result['final_epoch'] + 1}")
     print(f"  Total steps: {result['total_steps']}")
     print(f"  Best val loss: {result['best_val_loss']:.4f}")
-    print(f"  Best val acc (generator): {result['best_val_acc']*100:.1f}%")
+    print(f"  Best val acc: {result['best_val_acc']*100:.1f}%")
     print(f"  Training time: {total_time:.1f}s ({total_time/60:.1f}m)")
     
     # Save final checkpoint
     final_ckpt = CheckpointData(
         model_state=model.state_dict(),
         step=result['total_steps'],
-        epoch=result['epochs_completed'],
+        epoch=result['final_epoch'],
         best_val_loss=result['best_val_loss'],
-        metadata={
+        best_val_acc=result['best_val_acc'],
+        metrics={
             "training_time": total_time,
-            "best_val_acc": result['best_val_acc'],
             "data_mode": "semisynthetic",
             "train_datasets": [ds.name for ds in train_raw],
             "val_datasets": [ds.name for ds in val_raw],

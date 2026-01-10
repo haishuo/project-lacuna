@@ -6,7 +6,7 @@ device: cuda
 output_dir: /mnt/artifacts/project_lacuna/runs
 
 data:
-  n_range: [50, 100]
+  n_range: [50, 64]
   d_range: [3, 8]
   max_cols: 16
   max_rows: 64
