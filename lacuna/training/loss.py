@@ -642,9 +642,9 @@ class LacunaLoss(nn.Module):
         
         # === 3. Auxiliary Losses ===
         if compute_auxiliary:
-            # Load balance loss
-            if self.config.load_balance_weight > 0 and output.moe_output is not None:
-                lb_loss = load_balance_loss(output.moe_output.gate_probs)
+            # Load balance loss (uses output.moe, not output.moe_output)
+            if self.config.load_balance_weight > 0 and output.moe is not None:
+                lb_loss = load_balance_loss(output.moe.gate_probs)
                 loss_dict["load_balance_loss"] = lb_loss
                 total_loss = total_loss + self.config.load_balance_weight * lb_loss
             

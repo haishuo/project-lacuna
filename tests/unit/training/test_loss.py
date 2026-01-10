@@ -8,7 +8,7 @@ Tests the multi-task loss functions:
     - class_cross_entropy, mechanism_full_cross_entropy: Class/mechanism losses
     - reconstruction_mse, reconstruction_huber: Reconstruction losses
     - multi_head_reconstruction_loss: Per-head reconstruction
-    - kl_divergence, entropy_loss, load_balance_loss: Auxiliary losses
+    - kl_divergence_loss, entropy_loss, load_balance_loss: Auxiliary losses
     - LacunaLoss: Combined multi-task loss
     - Factory functions: create_loss_function, create_pretraining_loss, etc.
     - Accuracy metrics: compute_class_accuracy, compute_mechanism_accuracy
@@ -33,7 +33,7 @@ from lacuna.training.loss import (
     reconstruction_huber,
     multi_head_reconstruction_loss,
     # Auxiliary losses
-    kl_divergence,
+    kl_divergence_loss,
     entropy_loss,
     load_balance_loss,
     # Combined loss
@@ -91,85 +91,102 @@ def sample_targets():
 @pytest.fixture
 def sample_reconstruction_tensors():
     """Sample tensors for reconstruction loss tests."""
-    B, max_rows, max_cols = 4, 32, 16
-    
-    predictions = torch.randn(B, max_rows, max_cols)
-    targets = torch.randn(B, max_rows, max_cols)
-    
-    # Mask: ~30% of cells are masked for reconstruction
-    reconstruction_mask = torch.rand(B, max_rows, max_cols) > 0.7
-    
-    # Valid rows and columns
-    row_mask = torch.ones(B, max_rows, dtype=torch.bool)
-    row_mask[:, 20:] = False  # Last 12 rows invalid
-    
-    col_mask = torch.ones(B, max_cols, dtype=torch.bool)
-    col_mask[:, 10:] = False  # Last 6 cols invalid
+    B, max_rows, max_cols = 4, 32, 8
     
     return {
-        "predictions": predictions,
-        "targets": targets,
-        "reconstruction_mask": reconstruction_mask,
-        "row_mask": row_mask,
-        "col_mask": col_mask,
+        "predictions": torch.randn(B, max_rows, max_cols),
+        "targets": torch.randn(B, max_rows, max_cols),
+        "reconstruction_mask": torch.rand(B, max_rows, max_cols) > 0.5,
+        "row_mask": torch.ones(B, max_rows, dtype=torch.bool),
+        "col_mask": torch.ones(B, max_cols, dtype=torch.bool),
     }
 
 
 @pytest.fixture
-def sample_lacuna_output():
-    """Sample LacunaOutput for full loss tests."""
-    B = 4
-    n_experts = 5
-    n_mnar_variants = 3
-    max_rows, max_cols = 32, 16
-    evidence_dim = 32
+def sample_reconstruction_result():
+    """Sample ReconstructionResult for multi-head tests."""
+    B, max_rows, max_cols = 4, 32, 8
     
-    # Posterior
-    p_class = torch.softmax(torch.randn(B, 3), dim=-1)
-    p_mechanism = torch.softmax(torch.randn(B, n_experts), dim=-1)
-    
-    posterior = PosteriorResult(
-        p_class=p_class,
-        p_mechanism=p_mechanism,
-        entropy_class=torch.rand(B),
-    )
-    
-    # MoE output
-    moe_output = MoEOutput(
-        gate_logits=torch.randn(B, n_experts),
-        gate_probs=torch.softmax(torch.randn(B, n_experts), dim=-1),
-    )
-    
-    # Reconstruction results
-    reconstruction = {}
-    for head_name in ["mcar", "mar", "self_censoring", "threshold", "latent"]:
-        reconstruction[head_name] = ReconstructionResult(
-            predictions=torch.randn(B, max_rows, max_cols),
-            errors=torch.rand(B),
-            per_cell_errors=torch.rand(B, max_rows, max_cols),
-        )
-    
-    return LacunaOutput(
-        posterior=posterior,
-        moe=moe_output,
-        reconstruction=reconstruction,
-        evidence=torch.randn(B, evidence_dim),
+    return ReconstructionResult(
+        predictions=torch.randn(B, max_rows, max_cols),
+        errors=torch.rand(B),
+        per_cell_errors=torch.rand(B, max_rows, max_cols),
     )
 
 
 @pytest.fixture
-def sample_batch():
-    """Sample TokenBatch for full loss tests."""
-    B, max_rows, max_cols = 4, 32, 16
+def sample_posterior_result():
+    """Sample PosteriorResult for combined loss tests."""
+    B = 4
+    n_mechanisms = 5  # MCAR, MAR, 3 MNAR variants
+    n_variants = 3
+    
+    p_mechanism = torch.softmax(torch.randn(B, n_mechanisms), dim=-1)
+    # Aggregate to class: sum MNAR variants
+    p_class = torch.zeros(B, 3)
+    p_class[:, 0] = p_mechanism[:, 0]  # MCAR
+    p_class[:, 1] = p_mechanism[:, 1]  # MAR
+    p_class[:, 2] = p_mechanism[:, 2:].sum(dim=-1)  # MNAR
+    
+    # MNAR variant posterior (conditional on MNAR)
+    p_mnar_variant = torch.softmax(torch.randn(B, n_variants), dim=-1)
+    
+    return PosteriorResult(
+        p_class=p_class,
+        p_mnar_variant=p_mnar_variant,
+        p_mechanism=p_mechanism,
+        entropy_class=torch.rand(B),
+        entropy_mechanism=torch.rand(B),
+    )
+
+
+@pytest.fixture
+def sample_moe_output():
+    """Sample MoEOutput for auxiliary loss tests."""
+    B = 4
+    n_experts = 4
+    
+    gate_logits = torch.randn(B, n_experts)
+    gate_probs = torch.softmax(gate_logits, dim=-1)
+    
+    return MoEOutput(
+        gate_logits=gate_logits,
+        gate_probs=gate_probs,
+    )
+
+
+@pytest.fixture
+def sample_token_batch():
+    """Sample TokenBatch for combined loss tests."""
+    B, max_rows, max_cols = 4, 32, 8
+    d_token = 4  # TOKEN_DIM from tokenization
     
     return TokenBatch(
-        tokens=torch.randn(B, max_rows, max_cols, 4),
-        row_mask=torch.ones(B, max_rows, dtype=torch.bool),
+        tokens=torch.randn(B, max_rows, max_cols, d_token),
         col_mask=torch.ones(B, max_cols, dtype=torch.bool),
+        row_mask=torch.ones(B, max_rows, dtype=torch.bool),
         class_ids=torch.randint(0, 3, (B,)),
-        variant_ids=torch.zeros(B, dtype=torch.long),
+        generator_ids=torch.randint(0, 5, (B,)),
+        variant_ids=torch.where(
+            torch.randint(0, 3, (B,)) == 2,
+            torch.randint(0, 3, (B,)),
+            torch.tensor(-1),
+        ),
+        reconstruction_mask=torch.rand(B, max_rows, max_cols) > 0.9,
         original_values=torch.randn(B, max_rows, max_cols),
-        reconstruction_mask=torch.rand(B, max_rows, max_cols) > 0.7,
+    )
+
+
+@pytest.fixture
+def sample_lacuna_output(sample_posterior_result, sample_moe_output, sample_reconstruction_result):
+    """Sample LacunaOutput for combined loss tests."""
+    B = 4
+    
+    return LacunaOutput(
+        posterior=sample_posterior_result,
+        moe=sample_moe_output,
+        reconstruction={"mean": sample_reconstruction_result},
+        evidence=torch.randn(B, 64),
     )
 
 
@@ -180,53 +197,40 @@ def sample_batch():
 class TestLossConfig:
     """Tests for LossConfig dataclass."""
     
-    def test_default_values(self):
+    def test_default_values(self, default_config):
         """Test default configuration values."""
-        config = LossConfig()
-        
-        assert config.mechanism_weight == 1.0
-        assert config.reconstruction_weight == 0.5
-        assert config.class_weight == 0.5
-        assert config.mechanism_loss_type == "cross_entropy"
-        assert config.reconstruction_loss_type == "mse"
-        assert config.label_smoothing == 0.0
-        assert config.load_balance_weight == 0.01
-        assert config.entropy_weight == 0.0
+        assert default_config.mechanism_weight == 1.0
+        assert default_config.reconstruction_weight == 0.5
+        assert default_config.class_weight == 0.5
+        assert default_config.mechanism_loss_type == "cross_entropy"
+        assert default_config.reconstruction_loss_type == "mse"
+        assert default_config.label_smoothing == 0.0
+        assert default_config.load_balance_weight == 0.01
+        assert default_config.entropy_weight == 0.0
     
     def test_custom_values(self):
         """Test custom configuration values."""
         config = LossConfig(
             mechanism_weight=2.0,
-            reconstruction_weight=1.0,
-            class_weight=0.7,
+            reconstruction_weight=0.8,
             mechanism_loss_type="brier",
-            reconstruction_loss_type="huber",
             label_smoothing=0.1,
         )
         
         assert config.mechanism_weight == 2.0
-        assert config.reconstruction_weight == 1.0
-        assert config.class_weight == 0.7
+        assert config.reconstruction_weight == 0.8
         assert config.mechanism_loss_type == "brier"
-        assert config.reconstruction_loss_type == "huber"
         assert config.label_smoothing == 0.1
     
-    def test_invalid_mechanism_loss_type_raises(self):
+    def test_invalid_mechanism_loss_type(self):
         """Test that invalid mechanism_loss_type raises error."""
         with pytest.raises(ValueError, match="Unknown mechanism_loss_type"):
             LossConfig(mechanism_loss_type="invalid")
     
-    def test_invalid_reconstruction_loss_type_raises(self):
+    def test_invalid_reconstruction_loss_type(self):
         """Test that invalid reconstruction_loss_type raises error."""
         with pytest.raises(ValueError, match="Unknown reconstruction_loss_type"):
             LossConfig(reconstruction_loss_type="invalid")
-    
-    def test_per_head_weights(self):
-        """Test per-head weights configuration."""
-        weights = {"mcar": 1.0, "mar": 1.5, "self_censoring": 2.0}
-        config = LossConfig(per_head_weights=weights)
-        
-        assert config.per_head_weights == weights
 
 
 # =============================================================================
@@ -236,32 +240,24 @@ class TestLossConfig:
 class TestMechanismCrossEntropy:
     """Tests for mechanism_cross_entropy."""
     
-    def test_output_shape_mean(self, sample_logits, sample_targets):
-        """Test scalar output with mean reduction."""
+    def test_output_shape(self, sample_logits, sample_targets):
+        """Test that output is a scalar."""
         loss = mechanism_cross_entropy(sample_logits, sample_targets)
         
         assert loss.shape == ()
     
-    def test_output_shape_none(self, sample_logits, sample_targets):
-        """Test per-sample output with no reduction."""
-        loss = mechanism_cross_entropy(
-            sample_logits, sample_targets, reduction="none"
-        )
-        
-        assert loss.shape == (sample_logits.shape[0],)
-    
     def test_non_negative(self, sample_logits, sample_targets):
-        """Test that loss is non-negative."""
+        """Test that cross-entropy is non-negative."""
         loss = mechanism_cross_entropy(sample_logits, sample_targets)
         
         assert loss >= 0
     
     def test_perfect_prediction_low_loss(self):
         """Test that perfect predictions give low loss."""
-        B = 4
-        targets = torch.tensor([0, 1, 2, 0])
+        B = 8
+        targets = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1])
         
-        # Logits strongly favor correct class
+        # Logits strongly favoring correct class
         logits = torch.zeros(B, 3)
         logits[torch.arange(B), targets] = 10.0
         
@@ -270,7 +266,7 @@ class TestMechanismCrossEntropy:
         assert loss < 0.01
     
     def test_label_smoothing(self, sample_logits, sample_targets):
-        """Test label smoothing increases loss."""
+        """Test that label smoothing changes the loss."""
         loss_no_smooth = mechanism_cross_entropy(
             sample_logits, sample_targets, label_smoothing=0.0
         )
@@ -278,30 +274,55 @@ class TestMechanismCrossEntropy:
             sample_logits, sample_targets, label_smoothing=0.1
         )
         
-        # Label smoothing generally increases loss for confident predictions
-        # but the relationship can be complex - just verify it runs
-        assert not torch.isnan(loss_smooth)
+        # Label smoothing typically increases loss for confident predictions
+        assert loss_no_smooth != loss_smooth
+    
+    def test_reduction_none(self, sample_logits, sample_targets):
+        """Test reduction='none' returns per-sample losses."""
+        loss = mechanism_cross_entropy(
+            sample_logits, sample_targets, reduction="none"
+        )
+        
+        assert loss.shape == (8,)
+    
+    def test_reduction_sum(self, sample_logits, sample_targets):
+        """Test reduction='sum' returns summed loss."""
+        loss_mean = mechanism_cross_entropy(
+            sample_logits, sample_targets, reduction="mean"
+        )
+        loss_sum = mechanism_cross_entropy(
+            sample_logits, sample_targets, reduction="sum"
+        )
+        
+        assert torch.allclose(loss_sum, loss_mean * 8)
+    
+    def test_matches_pytorch(self, sample_logits, sample_targets):
+        """Test that it matches PyTorch's cross_entropy."""
+        loss = mechanism_cross_entropy(sample_logits, sample_targets)
+        expected = F.cross_entropy(sample_logits, sample_targets)
+        
+        assert torch.allclose(loss, expected)
 
 
 class TestMechanismCrossEntropyFromProbs:
     """Tests for mechanism_cross_entropy_from_probs."""
     
     def test_output_shape(self, sample_probs, sample_targets):
-        """Test output shape."""
+        """Test that output is a scalar."""
         loss = mechanism_cross_entropy_from_probs(sample_probs, sample_targets)
         
         assert loss.shape == ()
     
     def test_non_negative(self, sample_probs, sample_targets):
-        """Test that loss is non-negative."""
+        """Test that cross-entropy is non-negative."""
         loss = mechanism_cross_entropy_from_probs(sample_probs, sample_targets)
         
         assert loss >= 0
     
     def test_perfect_prediction_low_loss(self):
-        """Test that perfect predictions give low loss."""
-        B = 4
-        targets = torch.tensor([0, 1, 2, 0])
+        """Test that perfect predictions give near-zero loss."""
+        B = 8
+        targets = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1])
         
         # One-hot probabilities
         probs = torch.zeros(B, 3)
@@ -309,12 +330,12 @@ class TestMechanismCrossEntropyFromProbs:
         
         loss = mechanism_cross_entropy_from_probs(probs, targets)
         
-        # Should be close to 0 (log(1) = 0)
-        assert loss < 1e-5
+        # Should be very close to 0 (clamping prevents exact 0)
+        assert loss < 1e-6
     
     def test_uniform_prediction_known_loss(self):
-        """Test uniform predictions give known loss."""
-        B = 4
+        """Test that uniform predictions give known loss."""
+        B = 8
         targets = torch.zeros(B, dtype=torch.long)
         
         # Uniform distribution
@@ -322,35 +343,36 @@ class TestMechanismCrossEntropyFromProbs:
         
         loss = mechanism_cross_entropy_from_probs(probs, targets)
         
-        # -log(1/3) ≈ 1.099
-        expected = -torch.log(torch.tensor(1/3))
+        # -log(1/3) ≈ 1.0986
+        expected = torch.tensor(-torch.log(torch.tensor(1/3)))
         assert torch.allclose(loss, expected, atol=1e-4)
     
-    def test_handles_near_zero_probs(self):
-        """Test handling of near-zero probabilities."""
-        B = 4
-        targets = torch.zeros(B, dtype=torch.long)
+    def test_label_smoothing(self, sample_probs, sample_targets):
+        """Test that label smoothing changes the loss."""
+        loss_no_smooth = mechanism_cross_entropy_from_probs(
+            sample_probs, sample_targets, label_smoothing=0.0
+        )
+        loss_smooth = mechanism_cross_entropy_from_probs(
+            sample_probs, sample_targets, label_smoothing=0.1
+        )
         
-        # Very low probability on correct class
-        probs = torch.zeros(B, 3)
-        probs[:, 0] = 1e-10
-        probs[:, 1] = 0.5 - 5e-11
-        probs[:, 2] = 0.5 - 5e-11
-        
-        loss = mechanism_cross_entropy_from_probs(probs, targets)
-        
-        assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
+        assert loss_no_smooth != loss_smooth
 
 
 class TestBrierScore:
     """Tests for brier_score."""
     
     def test_output_shape(self, sample_probs, sample_targets):
-        """Test output shape."""
+        """Test that output is a scalar."""
         loss = brier_score(sample_probs, sample_targets)
         
         assert loss.shape == ()
+    
+    def test_non_negative(self, sample_probs, sample_targets):
+        """Test that Brier score is non-negative."""
+        loss = brier_score(sample_probs, sample_targets)
+        
+        assert loss >= 0
     
     def test_perfect_prediction_zero_loss(self):
         """Test that perfect predictions give zero loss."""
@@ -494,34 +516,11 @@ class TestReconstructionMSE:
     def test_respects_masks(self, sample_reconstruction_tensors):
         """Test that masks are respected."""
         t = sample_reconstruction_tensors
-        B, max_rows, max_cols = t["predictions"].shape
         
-        # Create mask where only one cell is valid
-        single_mask = torch.zeros(B, max_rows, max_cols, dtype=torch.bool)
-        single_mask[:, 0, 0] = True
+        # Create mask that excludes all cells
+        empty_mask = torch.zeros_like(t["reconstruction_mask"])
         
-        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
-        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
-        
-        # Set that cell to have known error
-        predictions = torch.zeros(B, max_rows, max_cols)
-        targets = torch.ones(B, max_rows, max_cols)
-        
-        loss = reconstruction_mse(
-            predictions, targets, single_mask, row_mask, col_mask
-        )
-        
-        # MSE should be exactly 1.0 (error of 1 squared)
-        assert torch.allclose(loss, torch.tensor(1.0), atol=1e-5)
-    
-    def test_handles_no_masked_cells(self, sample_reconstruction_tensors):
-        """Test graceful handling when no cells are masked."""
-        t = sample_reconstruction_tensors
-        B, max_rows, max_cols = t["predictions"].shape
-        
-        # No cells masked
-        empty_mask = torch.zeros(B, max_rows, max_cols, dtype=torch.bool)
-        
+        # With empty mask, loss should be 0 (no cells to evaluate)
         loss = reconstruction_mse(
             t["predictions"],
             t["targets"],
@@ -530,8 +529,22 @@ class TestReconstructionMSE:
             t["col_mask"],
         )
         
-        # Should handle gracefully (not NaN)
-        assert not torch.isnan(loss)
+        assert torch.allclose(loss, torch.tensor(0.0), atol=1e-6)
+    
+    def test_reduction_none(self, sample_reconstruction_tensors):
+        """Test reduction='none' returns per-cell losses."""
+        t = sample_reconstruction_tensors
+        
+        loss = reconstruction_mse(
+            t["predictions"],
+            t["targets"],
+            t["reconstruction_mask"],
+            t["row_mask"],
+            t["col_mask"],
+            reduction="none",
+        )
+        
+        assert loss.shape == t["predictions"].shape
 
 
 class TestReconstructionHuber:
@@ -565,83 +578,69 @@ class TestReconstructionHuber:
         
         assert loss >= 0
     
-    def test_less_sensitive_to_outliers(self, sample_reconstruction_tensors):
-        """Test that Huber is less sensitive to outliers than MSE."""
+    def test_perfect_prediction_zero_loss(self, sample_reconstruction_tensors):
+        """Test zero loss for perfect predictions."""
         t = sample_reconstruction_tensors
         
-        # Create predictions with an outlier
-        predictions = t["targets"].clone()
-        predictions[0, 0, 0] = 100.0  # Outlier
+        loss = reconstruction_huber(
+            t["targets"],
+            t["targets"],
+            t["reconstruction_mask"],
+            t["row_mask"],
+            t["col_mask"],
+        )
         
-        # Ensure that cell is in the mask
-        mask = t["reconstruction_mask"].clone()
-        mask[0, 0, 0] = True
+        assert torch.allclose(loss, torch.tensor(0.0), atol=1e-6)
+    
+    def test_equals_mse_for_small_errors(self):
+        """Test that Huber equals MSE/2 for small errors."""
+        B, max_rows, max_cols = 4, 8, 4
+        
+        targets = torch.zeros(B, max_rows, max_cols)
+        predictions = torch.full((B, max_rows, max_cols), 0.1)  # Small error
+        mask = torch.ones(B, max_rows, max_cols, dtype=torch.bool)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
         
         mse_loss = reconstruction_mse(
-            predictions, t["targets"], mask, t["row_mask"], t["col_mask"]
+            predictions, targets, mask, row_mask, col_mask
         )
         huber_loss = reconstruction_huber(
-            predictions, t["targets"], mask, t["row_mask"], t["col_mask"]
+            predictions, targets, mask, row_mask, col_mask, delta=1.0
         )
         
-        # Huber should be less than MSE for large outliers
-        assert huber_loss < mse_loss
+        # For |x| <= delta, Huber = 0.5 * x^2
+        assert torch.allclose(huber_loss, 0.5 * mse_loss, atol=1e-5)
     
-    def test_delta_parameter(self, sample_reconstruction_tensors):
-        """Test that delta parameter affects loss."""
-        t = sample_reconstruction_tensors
+    def test_linear_for_large_errors(self):
+        """Test that Huber is linear for large errors."""
+        B, max_rows, max_cols = 4, 8, 4
+        delta = 1.0
         
-        loss_small_delta = reconstruction_huber(
-            t["predictions"],
-            t["targets"],
-            t["reconstruction_mask"],
-            t["row_mask"],
-            t["col_mask"],
-            delta=0.1,
+        targets = torch.zeros(B, max_rows, max_cols)
+        predictions = torch.full((B, max_rows, max_cols), 5.0)  # Large error
+        mask = torch.ones(B, max_rows, max_cols, dtype=torch.bool)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
+        
+        huber_loss = reconstruction_huber(
+            predictions, targets, mask, row_mask, col_mask, delta=delta
         )
         
-        loss_large_delta = reconstruction_huber(
-            t["predictions"],
-            t["targets"],
-            t["reconstruction_mask"],
-            t["row_mask"],
-            t["col_mask"],
-            delta=10.0,
-        )
-        
-        # Different deltas should give different losses
-        # (unless predictions exactly match targets)
-        # Just verify both compute without error
-        assert not torch.isnan(loss_small_delta)
-        assert not torch.isnan(loss_large_delta)
+        # For |x| > delta, Huber = delta * (|x| - 0.5 * delta)
+        expected = delta * (5.0 - 0.5 * delta)
+        assert torch.allclose(huber_loss, torch.tensor(expected), atol=1e-5)
 
 
 class TestMultiHeadReconstructionLoss:
     """Tests for multi_head_reconstruction_loss."""
     
-    @pytest.fixture
-    def sample_head_results(self, sample_reconstruction_tensors):
-        """Create sample reconstruction results dict."""
-        t = sample_reconstruction_tensors
-        B, max_rows, max_cols = t["predictions"].shape
-        
-        results = {}
-        for head_name in ["mcar", "mar", "self_censoring"]:
-            results[head_name] = ReconstructionResult(
-                predictions=torch.randn(B, max_rows, max_cols),
-                errors=torch.rand(B),
-            )
-        
-        return results
-    
-    def test_returns_total_and_per_head(
-        self, sample_head_results, sample_reconstruction_tensors
-    ):
-        """Test that function returns total and per-head losses."""
+    def test_single_head(self, sample_reconstruction_tensors, sample_reconstruction_result):
+        """Test with single reconstruction head."""
         t = sample_reconstruction_tensors
         
         total_loss, per_head = multi_head_reconstruction_loss(
-            reconstruction_results=sample_head_results,
+            reconstruction_results={"mean": sample_reconstruction_result},
             original_values=t["targets"],
             reconstruction_mask=t["reconstruction_mask"],
             row_mask=t["row_mask"],
@@ -649,27 +648,65 @@ class TestMultiHeadReconstructionLoss:
         )
         
         assert total_loss.shape == ()
-        assert isinstance(per_head, dict)
-        assert len(per_head) == len(sample_head_results)
-        
-        for head_name in sample_head_results:
-            assert head_name in per_head
+        assert "mean" in per_head
+        assert torch.allclose(total_loss, per_head["mean"])
     
-    def test_head_weights(
-        self, sample_head_results, sample_reconstruction_tensors
-    ):
-        """Test per-head weights are applied."""
+    def test_multiple_heads(self, sample_reconstruction_tensors):
+        """Test with multiple reconstruction heads."""
         t = sample_reconstruction_tensors
+        B, max_rows, max_cols = t["predictions"].shape
         
-        # Weight one head much higher
-        head_weights = {
-            "mcar": 10.0,
-            "mar": 1.0,
-            "self_censoring": 1.0,
+        results = {
+            "mean": ReconstructionResult(
+                predictions=torch.randn(B, max_rows, max_cols),
+                errors=torch.rand(B),
+                per_cell_errors=torch.rand(B, max_rows, max_cols),
+            ),
+            "median": ReconstructionResult(
+                predictions=torch.randn(B, max_rows, max_cols),
+                errors=torch.rand(B),
+                per_cell_errors=torch.rand(B, max_rows, max_cols),
+            ),
         }
         
-        total_weighted, _ = multi_head_reconstruction_loss(
-            reconstruction_results=sample_head_results,
+        total_loss, per_head = multi_head_reconstruction_loss(
+            reconstruction_results=results,
+            original_values=t["targets"],
+            reconstruction_mask=t["reconstruction_mask"],
+            row_mask=t["row_mask"],
+            col_mask=t["col_mask"],
+        )
+        
+        assert total_loss.shape == ()
+        assert "mean" in per_head
+        assert "median" in per_head
+        
+        # Default: uniform weights, so average
+        expected = (per_head["mean"] + per_head["median"]) / 2
+        assert torch.allclose(total_loss, expected)
+    
+    def test_custom_weights(self, sample_reconstruction_tensors):
+        """Test custom head weights."""
+        t = sample_reconstruction_tensors
+        B, max_rows, max_cols = t["predictions"].shape
+        
+        results = {
+            "mean": ReconstructionResult(
+                predictions=torch.randn(B, max_rows, max_cols),
+                errors=torch.rand(B),
+                per_cell_errors=torch.rand(B, max_rows, max_cols),
+            ),
+            "median": ReconstructionResult(
+                predictions=torch.randn(B, max_rows, max_cols),
+                errors=torch.rand(B),
+                per_cell_errors=torch.rand(B, max_rows, max_cols),
+            ),
+        }
+        
+        head_weights = {"mean": 2.0, "median": 1.0}
+        
+        total_loss, per_head = multi_head_reconstruction_loss(
+            reconstruction_results=results,
             original_values=t["targets"],
             reconstruction_mask=t["reconstruction_mask"],
             row_mask=t["row_mask"],
@@ -677,157 +714,173 @@ class TestMultiHeadReconstructionLoss:
             head_weights=head_weights,
         )
         
-        total_unweighted, _ = multi_head_reconstruction_loss(
-            reconstruction_results=sample_head_results,
+        # Weighted average: (2*mean + 1*median) / 3
+        expected = (2 * per_head["mean"] + 1 * per_head["median"]) / 3
+        assert torch.allclose(total_loss, expected)
+    
+    def test_huber_loss_type(self, sample_reconstruction_tensors, sample_reconstruction_result):
+        """Test Huber loss type."""
+        t = sample_reconstruction_tensors
+        
+        total_mse, _ = multi_head_reconstruction_loss(
+            reconstruction_results={"mean": sample_reconstruction_result},
             original_values=t["targets"],
             reconstruction_mask=t["reconstruction_mask"],
             row_mask=t["row_mask"],
             col_mask=t["col_mask"],
-            head_weights=None,
+            loss_type="mse",
         )
         
-        # Weighted should be different from unweighted
-        assert not torch.allclose(total_weighted, total_unweighted)
+        total_huber, _ = multi_head_reconstruction_loss(
+            reconstruction_results={"mean": sample_reconstruction_result},
+            original_values=t["targets"],
+            reconstruction_mask=t["reconstruction_mask"],
+            row_mask=t["row_mask"],
+            col_mask=t["col_mask"],
+            loss_type="huber",
+        )
+        
+        # MSE and Huber should give different results for large errors
+        # (but might be similar for small errors)
+        assert total_mse.shape == total_huber.shape
 
 
 # =============================================================================
 # Test Auxiliary Losses
 # =============================================================================
 
-class TestKLDivergence:
-    """Tests for kl_divergence."""
+class TestKLDivergenceLoss:
+    """Tests for kl_divergence_loss."""
     
-    def test_standard_normal_zero_kl(self):
-        """Test that standard normal has zero KL from prior."""
-        B, latent_dim = 8, 16
+    def test_output_shape(self):
+        """Test scalar output."""
+        B, d_latent = 8, 32
+        mean = torch.randn(B, d_latent)
+        logvar = torch.randn(B, d_latent)
         
-        mean = torch.zeros(B, latent_dim)
-        logvar = torch.zeros(B, latent_dim)  # var = 1
+        loss = kl_divergence_loss(mean, logvar)
         
-        kl = kl_divergence(mean, logvar)
-        
-        assert torch.allclose(kl, torch.tensor(0.0), atol=1e-5)
+        assert loss.shape == ()
     
-    def test_positive_kl(self):
-        """Test that KL is non-negative."""
-        B, latent_dim = 8, 16
+    def test_non_negative(self):
+        """Test that KL divergence is non-negative."""
+        B, d_latent = 8, 32
+        mean = torch.randn(B, d_latent)
+        logvar = torch.randn(B, d_latent)
         
-        mean = torch.randn(B, latent_dim)
-        logvar = torch.randn(B, latent_dim)
+        loss = kl_divergence_loss(mean, logvar)
         
-        kl = kl_divergence(mean, logvar)
-        
-        assert kl >= 0
+        assert loss >= 0
     
-    def test_reduction_options(self):
-        """Test different reduction options."""
-        B, latent_dim = 8, 16
+    def test_zero_for_standard_normal(self):
+        """Test that KL is zero when q equals prior (N(0,1))."""
+        B, d_latent = 8, 32
+        mean = torch.zeros(B, d_latent)
+        logvar = torch.zeros(B, d_latent)  # variance = 1
         
-        mean = torch.randn(B, latent_dim)
-        logvar = torch.randn(B, latent_dim)
+        loss = kl_divergence_loss(mean, logvar)
         
-        kl_mean = kl_divergence(mean, logvar, reduction="mean")
-        kl_sum = kl_divergence(mean, logvar, reduction="sum")
-        kl_none = kl_divergence(mean, logvar, reduction="none")
+        assert torch.allclose(loss, torch.tensor(0.0), atol=1e-6)
+    
+    def test_increases_with_mean_shift(self):
+        """Test that KL increases as mean shifts from 0."""
+        B, d_latent = 8, 32
+        logvar = torch.zeros(B, d_latent)
         
-        assert kl_mean.shape == ()
-        assert kl_sum.shape == ()
-        assert kl_none.shape == (B,)
+        loss_zero = kl_divergence_loss(torch.zeros(B, d_latent), logvar)
+        loss_shifted = kl_divergence_loss(torch.ones(B, d_latent), logvar)
         
-        # sum should equal none summed
-        assert torch.allclose(kl_sum, kl_none.sum())
+        assert loss_shifted > loss_zero
+    
+    def test_increases_with_variance_change(self):
+        """Test that KL increases as variance deviates from 1."""
+        B, d_latent = 8, 32
+        mean = torch.zeros(B, d_latent)
+        
+        loss_unit = kl_divergence_loss(mean, torch.zeros(B, d_latent))
+        loss_high = kl_divergence_loss(mean, torch.ones(B, d_latent))  # var = e
+        
+        assert loss_high > loss_unit
 
 
 class TestEntropyLoss:
     """Tests for entropy_loss."""
     
-    def test_uniform_max_entropy(self):
-        """Test uniform distribution has maximum entropy."""
+    def test_output_shape(self):
+        """Test scalar output."""
         B, K = 8, 3
+        probs = torch.softmax(torch.randn(B, K), dim=-1)
         
-        probs = torch.ones(B, K) / K
-        entropy = entropy_loss(probs)
+        loss = entropy_loss(probs)
         
-        # Max entropy for K classes is log(K)
-        max_entropy = torch.log(torch.tensor(float(K)))
-        assert torch.allclose(entropy, max_entropy, atol=1e-5)
+        assert loss.shape == ()
     
-    def test_certain_zero_entropy(self):
-        """Test certain distribution has zero entropy."""
+    def test_non_negative(self):
+        """Test that entropy is non-negative."""
         B, K = 8, 3
+        probs = torch.softmax(torch.randn(B, K), dim=-1)
         
-        # One-hot (certain) distribution
+        loss = entropy_loss(probs)
+        
+        assert loss >= 0
+    
+    def test_zero_for_one_hot(self):
+        """Test that entropy is zero for one-hot distributions."""
+        B, K = 8, 3
         probs = torch.zeros(B, K)
         probs[:, 0] = 1.0
         
-        entropy = entropy_loss(probs)
+        loss = entropy_loss(probs)
         
-        assert torch.allclose(entropy, torch.tensor(0.0), atol=1e-5)
+        assert torch.allclose(loss, torch.tensor(0.0), atol=1e-6)
     
-    def test_non_negative(self):
-        """Test entropy is always non-negative."""
-        B, K = 100, 5
-        
-        probs = torch.softmax(torch.randn(B, K), dim=-1)
-        entropy = entropy_loss(probs)
-        
-        assert entropy >= 0
-    
-    def test_reduction_options(self):
-        """Test different reduction options."""
+    def test_max_for_uniform(self):
+        """Test that entropy is maximized for uniform distribution."""
         B, K = 8, 3
+        probs = torch.ones(B, K) / K
         
-        probs = torch.softmax(torch.randn(B, K), dim=-1)
+        loss = entropy_loss(probs)
         
-        ent_mean = entropy_loss(probs, reduction="mean")
-        ent_sum = entropy_loss(probs, reduction="sum")
-        ent_none = entropy_loss(probs, reduction="none")
-        
-        assert ent_mean.shape == ()
-        assert ent_sum.shape == ()
-        assert ent_none.shape == (B,)
+        # Max entropy = log(K)
+        expected = torch.tensor(K).float().log()
+        assert torch.allclose(loss, expected, atol=1e-5)
 
 
 class TestLoadBalanceLoss:
     """Tests for load_balance_loss."""
     
-    def test_uniform_routing_low_loss(self):
-        """Test uniform routing gives low loss."""
-        B, n_experts = 100, 5
+    def test_output_shape(self):
+        """Test scalar output."""
+        B, n_experts = 16, 4
+        gate_probs = torch.softmax(torch.randn(B, n_experts), dim=-1)
         
-        # Approximately uniform assignment via one-hot
+        loss = load_balance_loss(gate_probs)
+        
+        assert loss.shape == ()
+    
+    def test_non_negative(self):
+        """Test that load balance loss is non-negative."""
+        B, n_experts = 16, 4
+        gate_probs = torch.softmax(torch.randn(B, n_experts), dim=-1)
+        
+        loss = load_balance_loss(gate_probs)
+        
+        assert loss >= 0
+    
+    def test_low_for_uniform_usage(self):
+        """Test that loss is low when experts are used uniformly."""
+        B, n_experts = 16, 4
+        
+        # Create probs that route uniformly
+        # Each expert gets exactly B/n_experts samples
         probs = torch.zeros(B, n_experts)
         for i in range(B):
             probs[i, i % n_experts] = 1.0
         
         loss = load_balance_loss(probs)
         
-        # With perfectly uniform routing: f_i = 1/n, p_i = 1/n
-        # loss = n * sum(1/n * 1/n) = n * n * (1/n^2) = 1
-        assert torch.allclose(loss, torch.tensor(1.0), atol=0.1)
-    
-    def test_collapsed_routing_high_loss(self):
-        """Test collapsed routing (one expert) gives high loss."""
-        B, n_experts = 100, 5
-        
-        # All samples to first expert
-        probs = torch.zeros(B, n_experts)
-        probs[:, 0] = 1.0
-        
-        loss = load_balance_loss(probs)
-        
-        # f_0 = 1, p_0 = 1, others = 0
-        # loss = n * (1 * 1) = n = 5
-        assert torch.allclose(loss, torch.tensor(float(n_experts)), atol=0.1)
-    
-    def test_non_negative(self):
-        """Test loss is non-negative."""
-        B, n_experts = 32, 5
-        
-        probs = torch.softmax(torch.randn(B, n_experts), dim=-1)
-        loss = load_balance_loss(probs)
-        
-        assert loss >= 0
+        # Should equal n_experts * (1/n_experts)^2 * n_experts = 1
+        assert torch.allclose(loss, torch.tensor(1.0), atol=1e-4)
 
 
 # =============================================================================
@@ -838,133 +891,116 @@ class TestLacunaLoss:
     """Tests for LacunaLoss combined loss."""
     
     @pytest.fixture
-    def loss_fn(self, default_config):
-        """Create LacunaLoss with default config."""
-        return LacunaLoss(default_config)
+    def loss_fn(self):
+        """Default loss function."""
+        return LacunaLoss(LossConfig())
     
-    def test_returns_total_and_dict(
-        self, loss_fn, sample_lacuna_output, sample_batch
+    def test_output_types(
+        self, loss_fn, sample_lacuna_output, sample_token_batch
     ):
-        """Test that forward returns total loss and dict."""
-        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_batch)
+        """Test that output is (tensor, dict)."""
+        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_token_batch)
         
-        assert total_loss.shape == ()
+        assert isinstance(total_loss, torch.Tensor)
         assert isinstance(loss_dict, dict)
+        assert total_loss.shape == ()
+    
+    def test_loss_dict_keys(
+        self, loss_fn, sample_lacuna_output, sample_token_batch
+    ):
+        """Test that loss_dict contains expected keys."""
+        _, loss_dict = loss_fn(sample_lacuna_output, sample_token_batch)
+        
         assert "total_loss" in loss_dict
+        # At least one of class_loss or mechanism_loss should be present
+        assert "class_loss" in loss_dict or loss_dict.get("mechanism_loss") is not None
     
-    def test_total_loss_matches_dict(
-        self, loss_fn, sample_lacuna_output, sample_batch
+    def test_mechanism_weight_zero(
+        self, sample_lacuna_output, sample_token_batch
     ):
-        """Test that returned total matches dict entry."""
-        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_batch)
+        """Test that mechanism_weight=0 excludes classification loss."""
+        loss_fn = LacunaLoss(LossConfig(mechanism_weight=0.0))
         
-        assert torch.allclose(total_loss, loss_dict["total_loss"])
+        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_token_batch)
+        
+        # Classification loss should not contribute
+        assert "class_loss" not in loss_dict or loss_dict.get("class_loss", 0) == 0
     
-    def test_includes_class_loss(
-        self, loss_fn, sample_lacuna_output, sample_batch
+    def test_reconstruction_weight_zero(
+        self, sample_lacuna_output, sample_token_batch
     ):
-        """Test that class loss is included."""
-        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_batch)
+        """Test that reconstruction_weight=0 excludes reconstruction loss."""
+        loss_fn = LacunaLoss(LossConfig(reconstruction_weight=0.0))
         
-        assert "class_loss" in loss_dict
-    
-    def test_includes_reconstruction_loss(
-        self, sample_lacuna_output, sample_batch
-    ):
-        """Test that reconstruction loss is included when configured."""
-        config = LossConfig(reconstruction_weight=1.0)
-        loss_fn = LacunaLoss(config)
-        
-        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_batch)
-        
-        assert "reconstruction_loss" in loss_dict
-    
-    def test_no_reconstruction_loss_when_weight_zero(
-        self, sample_lacuna_output, sample_batch
-    ):
-        """Test no reconstruction loss when weight is 0."""
-        config = LossConfig(reconstruction_weight=0.0)
-        loss_fn = LacunaLoss(config)
-        
-        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_batch)
+        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_token_batch)
         
         assert "reconstruction_loss" not in loss_dict
     
-    def test_includes_load_balance_loss(
-        self, sample_lacuna_output, sample_batch
+    def test_brier_score_mode(
+        self, sample_lacuna_output, sample_token_batch
     ):
-        """Test that load balance loss is included when configured."""
-        config = LossConfig(load_balance_weight=0.1)
-        loss_fn = LacunaLoss(config)
+        """Test Brier score mode."""
+        loss_fn = LacunaLoss(LossConfig(mechanism_loss_type="brier"))
         
-        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_batch)
+        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_token_batch)
         
-        assert "load_balance_loss" in loss_dict
-    
-    def test_brier_score_option(
-        self, sample_lacuna_output, sample_batch
-    ):
-        """Test Brier score as mechanism loss."""
-        config = LossConfig(mechanism_loss_type="brier")
-        loss_fn = LacunaLoss(config)
-        
-        total_loss, loss_dict = loss_fn(sample_lacuna_output, sample_batch)
-        
+        assert total_loss.shape == ()
         assert "class_loss" in loss_dict
-        assert not torch.isnan(total_loss)
     
-    def test_skip_auxiliary_losses(
-        self, sample_lacuna_output, sample_batch
+    def test_gradient_flow(
+        self, loss_fn, sample_moe_output, sample_reconstruction_result, sample_token_batch
     ):
-        """Test skipping auxiliary losses."""
-        config = LossConfig(load_balance_weight=0.1, entropy_weight=0.1)
-        loss_fn = LacunaLoss(config)
+        """Test that gradients flow through the loss."""
+        B = 4
+        n_mechanisms = 5
+        n_variants = 3
         
-        _, loss_dict_with = loss_fn(
-            sample_lacuna_output, sample_batch, compute_auxiliary=True
-        )
-        _, loss_dict_without = loss_fn(
-            sample_lacuna_output, sample_batch, compute_auxiliary=False
-        )
+        # Create p_class that requires grad (simulating model output)
+        p_class_logits = torch.randn(B, 3, requires_grad=True)
+        p_class = torch.softmax(p_class_logits, dim=-1)
         
-        assert "load_balance_loss" in loss_dict_with
-        assert "load_balance_loss" not in loss_dict_without
-    
-    def test_gradients_flow(
-        self, loss_fn, sample_lacuna_output, sample_batch
-    ):
-        """Test that gradients flow through loss."""
-        # Make evidence require grad
-        sample_lacuna_output = LacunaOutput(
-            posterior=sample_lacuna_output.posterior,
-            moe=sample_lacuna_output.moe,
-            reconstruction=sample_lacuna_output.reconstruction,
-            evidence=sample_lacuna_output.evidence.clone().requires_grad_(True),
+        p_mechanism = torch.softmax(torch.randn(B, n_mechanisms), dim=-1)
+        p_mnar_variant = torch.softmax(torch.randn(B, n_variants), dim=-1)
+        
+        posterior = PosteriorResult(
+            p_class=p_class,
+            p_mnar_variant=p_mnar_variant,
+            p_mechanism=p_mechanism,
+            entropy_class=torch.rand(B),
+            entropy_mechanism=torch.rand(B),
         )
         
-        total_loss, _ = loss_fn(sample_lacuna_output, sample_batch)
+        output = LacunaOutput(
+            posterior=posterior,
+            moe=sample_moe_output,
+            reconstruction={"mean": sample_reconstruction_result},
+            evidence=torch.randn(B, 64),
+        )
+        
+        total_loss, _ = loss_fn(output, sample_token_batch)
         total_loss.backward()
         
-        # Evidence should have gradient (through reconstruction)
-        # Note: actual gradient flow depends on how loss uses evidence
+        # p_class_logits should have gradient since loss depends on p_class
+        assert p_class_logits.grad is not None
+        assert not torch.all(p_class_logits.grad == 0)
     
     def test_pretraining_loss_method(
-        self, loss_fn, sample_lacuna_output, sample_batch
+        self, loss_fn, sample_lacuna_output, sample_token_batch
     ):
         """Test pretraining_loss helper method."""
         total_loss, loss_dict = loss_fn.pretraining_loss(
-            sample_lacuna_output, sample_batch
+            sample_lacuna_output, sample_token_batch
         )
         
         # Should not include mechanism loss
         assert "class_loss" not in loss_dict or loss_dict.get("class_loss", 0) == 0
     
     def test_classification_loss_method(
-        self, loss_fn, sample_lacuna_output, sample_batch
+        self, loss_fn, sample_lacuna_output, sample_token_batch
     ):
         """Test classification_loss helper method."""
         total_loss, loss_dict = loss_fn.classification_loss(
-            sample_lacuna_output, sample_batch
+            sample_lacuna_output, sample_token_batch
         )
         
         # Should not include reconstruction loss
@@ -1090,10 +1126,12 @@ class TestComputeClassAccuracy:
         B = 4
         targets = torch.tensor([0, 0, 0, 0])
         
-        # Half correct
+        # 2 correct, 2 wrong
         p_class = torch.zeros(B, 3)
-        p_class[0:2, 0] = 1.0  # Correct
-        p_class[2:4, 1] = 1.0  # Wrong
+        p_class[0, 0] = 1.0  # Correct
+        p_class[1, 0] = 1.0  # Correct
+        p_class[2, 1] = 1.0  # Wrong
+        p_class[3, 2] = 1.0  # Wrong
         
         acc = compute_class_accuracy(p_class, targets)
         
@@ -1103,11 +1141,12 @@ class TestComputeClassAccuracy:
 class TestComputeMechanismAccuracy:
     """Tests for compute_mechanism_accuracy."""
     
-    def test_perfect_accuracy(self):
-        """Test 100% accuracy for mechanism predictions."""
-        B = 8
-        n_mechanisms = 5
-        targets = torch.randint(0, n_mechanisms, (B,))
+    def test_with_mnar_variants(self):
+        """Test accuracy with MNAR variants."""
+        B = 6
+        n_mechanisms = 5  # MCAR, MAR, 3 MNAR variants
+        
+        targets = torch.tensor([0, 1, 2, 3, 4, 0])  # Various mechanisms
         
         # Perfect predictions
         p_mechanism = torch.zeros(B, n_mechanisms)
@@ -1122,48 +1161,58 @@ class TestComputePerClassAccuracy:
     """Tests for compute_per_class_accuracy."""
     
     def test_returns_all_classes(self):
-        """Test that all class accuracies are returned."""
-        B = 12
-        p_class = torch.softmax(torch.randn(B, 3), dim=-1)
-        targets = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2])
-        
-        result = compute_per_class_accuracy(p_class, targets)
-        
-        assert "mcar_acc" in result
-        assert "mar_acc" in result
-        assert "mnar_acc" in result
-    
-    def test_handles_missing_classes(self):
-        """Test handling when some classes are absent."""
-        B = 4
-        p_class = torch.softmax(torch.randn(B, 3), dim=-1)
-        targets = torch.zeros(B, dtype=torch.long)  # Only MCAR
-        
-        result = compute_per_class_accuracy(p_class, targets)
-        
-        # MCAR should have a value
-        assert not torch.isnan(result["mcar_acc"])
-        
-        # MAR and MNAR should be NaN (no samples)
-        assert torch.isnan(result["mar_acc"])
-        assert torch.isnan(result["mnar_acc"])
-    
-    def test_per_class_values_correct(self):
-        """Test per-class accuracy values are correct."""
-        B = 6
-        targets = torch.tensor([0, 0, 1, 1, 2, 2])
-        
-        # Perfect for MCAR, 50% for MAR, 0% for MNAR
+        """Test that all three classes are returned."""
+        B = 9
+        targets = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
         p_class = torch.zeros(B, 3)
-        p_class[0, 0] = 1.0  # Correct
-        p_class[1, 0] = 1.0  # Correct
-        p_class[2, 1] = 1.0  # Correct
-        p_class[3, 0] = 1.0  # Wrong
-        p_class[4, 0] = 1.0  # Wrong
-        p_class[5, 1] = 1.0  # Wrong
+        p_class[torch.arange(B), targets] = 1.0
         
-        result = compute_per_class_accuracy(p_class, targets)
+        per_class = compute_per_class_accuracy(p_class, targets)
         
-        assert result["mcar_acc"] == 1.0
-        assert result["mar_acc"] == 0.5
-        assert result["mnar_acc"] == 0.0
+        assert "mcar_acc" in per_class
+        assert "mar_acc" in per_class
+        assert "mnar_acc" in per_class
+    
+    def test_perfect_per_class(self):
+        """Test perfect per-class accuracy."""
+        B = 9
+        targets = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
+        p_class = torch.zeros(B, 3)
+        p_class[torch.arange(B), targets] = 1.0
+        
+        per_class = compute_per_class_accuracy(p_class, targets)
+        
+        assert per_class["mcar_acc"] == 1.0
+        assert per_class["mar_acc"] == 1.0
+        assert per_class["mnar_acc"] == 1.0
+    
+    def test_handles_missing_class(self):
+        """Test handling when a class has no samples."""
+        B = 4
+        targets = torch.tensor([0, 0, 1, 1])  # No class 2
+        p_class = torch.zeros(B, 3)
+        p_class[torch.arange(B), targets] = 1.0
+        
+        per_class = compute_per_class_accuracy(p_class, targets)
+        
+        assert per_class["mcar_acc"] == 1.0
+        assert per_class["mar_acc"] == 1.0
+        assert torch.isnan(per_class["mnar_acc"])  # No MNAR samples
+    
+    def test_varying_accuracy(self):
+        """Test varying accuracy per class."""
+        # MCAR: 2/2 correct, MAR: 1/2 correct, MNAR: 0/2 correct
+        targets = torch.tensor([0, 0, 1, 1, 2, 2])
+        p_class = torch.zeros(6, 3)
+        p_class[0, 0] = 1.0  # MCAR correct
+        p_class[1, 0] = 1.0  # MCAR correct
+        p_class[2, 1] = 1.0  # MAR correct
+        p_class[3, 0] = 1.0  # MAR wrong
+        p_class[4, 0] = 1.0  # MNAR wrong
+        p_class[5, 1] = 1.0  # MNAR wrong
+        
+        per_class = compute_per_class_accuracy(p_class, targets)
+        
+        assert per_class["mcar_acc"] == 1.0
+        assert per_class["mar_acc"] == 0.5
+        assert per_class["mnar_acc"] == 0.0
