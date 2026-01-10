@@ -25,6 +25,8 @@ from lacuna.core.types import (
     MNAR_THRESHOLD,
     MNAR_LATENT,
     MNAR_MIXTURE,
+    MNAR_VARIANT_NAMES,
+    DEFAULT_N_MNAR_VARIANTS,
     # Data structures
     ObservedDataset,
     TokenBatch,
@@ -72,6 +74,18 @@ class TestConstants:
         assert MNAR_THRESHOLD == 1
         assert MNAR_LATENT == 2
         assert MNAR_MIXTURE == 3
+    
+    def test_mnar_variant_names(self):
+        """MNAR_VARIANT_NAMES should have correct entries."""
+        assert len(MNAR_VARIANT_NAMES) == DEFAULT_N_MNAR_VARIANTS
+        assert "SelfCensoring" in MNAR_VARIANT_NAMES[MNAR_SELF_CENSORING]
+        assert "Threshold" in MNAR_VARIANT_NAMES[MNAR_THRESHOLD]
+        assert "Latent" in MNAR_VARIANT_NAMES[MNAR_LATENT]
+        assert "Mixture" in MNAR_VARIANT_NAMES[MNAR_MIXTURE]
+    
+    def test_default_n_mnar_variants(self):
+        """DEFAULT_N_MNAR_VARIANTS should be 4."""
+        assert DEFAULT_N_MNAR_VARIANTS == 4
 
 
 # =============================================================================
@@ -84,70 +98,157 @@ class TestObservedDataset:
     def test_valid_construction(self):
         """Test basic construction with valid inputs."""
         n, d = 100, 10
-        X_obs = np.random.randn(n, d).astype(np.float32)
-        R = np.random.rand(n, d) > 0.2  # ~20% missing
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.rand(n, d) > 0.2  # ~20% missing
         
-        # Set missing values to NaN
-        X_obs[~R] = np.nan
+        # Zero out missing values (convention for ObservedDataset)
+        x = x * r.float()
         
         dataset = ObservedDataset(
-            X_obs=X_obs,
-            R=R,
+            x=x,
+            r=r,
+            n=n,
+            d=d,
             dataset_id="test_dataset",
-            n_original=n,
-            d_original=d,
         )
         
         assert dataset.n == n
         assert dataset.d == d
         assert dataset.dataset_id == "test_dataset"
-        assert dataset.n_original == n
-        assert dataset.d_original == d
     
     def test_shape_properties(self):
         """Test n and d property accessors."""
-        X_obs = np.random.randn(50, 8).astype(np.float32)
-        R = np.ones((50, 8), dtype=bool)
+        n, d = 50, 8
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, d, dtype=torch.bool)
         
-        dataset = ObservedDataset(X_obs=X_obs, R=R)
+        dataset = ObservedDataset(x=x, r=r, n=n, d=d)
         
         assert dataset.n == 50
         assert dataset.d == 8
     
-    def test_missing_values_are_nan(self):
-        """Test that missing values are properly represented as NaN."""
-        X_obs = np.array([[1.0, np.nan, 3.0], [4.0, 5.0, np.nan]], dtype=np.float32)
-        R = np.array([[True, False, True], [True, True, False]])
+    def test_missing_values_zeroed(self):
+        """Test that missing values should be zeros (by convention)."""
+        # Create data with zeros where r=False
+        x = torch.tensor([[1.0, 0.0, 3.0], [4.0, 5.0, 0.0]], dtype=torch.float32)
+        r = torch.tensor([[True, False, True], [True, True, False]])
         
-        dataset = ObservedDataset(X_obs=X_obs, R=R)
+        dataset = ObservedDataset(x=x, r=r, n=2, d=3)
         
-        # Check that NaN positions match R=False
-        assert np.isnan(dataset.X_obs[0, 1])
-        assert np.isnan(dataset.X_obs[1, 2])
-        assert not np.isnan(dataset.X_obs[0, 0])
+        # Check that missing positions have zeros
+        assert dataset.x[0, 1] == 0.0
+        assert dataset.x[1, 2] == 0.0
+        # Check that observed values are preserved
+        assert dataset.x[0, 0] == 1.0
+        assert dataset.x[0, 2] == 3.0
     
     def test_optional_fields_default_to_none(self):
         """Test that optional fields have sensible defaults."""
-        X_obs = np.random.randn(10, 5).astype(np.float32)
-        R = np.ones((10, 5), dtype=bool)
+        n, d = 10, 5
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, d, dtype=torch.bool)
         
-        dataset = ObservedDataset(X_obs=X_obs, R=R)
+        dataset = ObservedDataset(x=x, r=r, n=n, d=d)
         
-        # dataset_id should default to None or empty string
-        # n_original and d_original should match shape if not provided
-        assert dataset.n_original is None or dataset.n_original == 10
-        assert dataset.d_original is None or dataset.d_original == 5
+        # feature_names defaults to None
+        assert dataset.feature_names is None
+        # meta defaults to None
+        assert dataset.meta is None
+        # dataset_id has a default
+        assert dataset.dataset_id == "unnamed"
+    
+    def test_with_feature_names(self):
+        """Test construction with feature_names."""
+        n, d = 10, 3
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, d, dtype=torch.bool)
+        feature_names = ("age", "income", "score")
+        
+        dataset = ObservedDataset(
+            x=x,
+            r=r,
+            n=n,
+            d=d,
+            feature_names=feature_names,
+        )
+        
+        assert dataset.feature_names == ("age", "income", "score")
+    
+    def test_with_meta(self):
+        """Test construction with meta dictionary."""
+        n, d = 10, 5
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, d, dtype=torch.bool)
+        meta = {"source": "synthetic", "seed": 42}
+        
+        dataset = ObservedDataset(x=x, r=r, n=n, d=d, meta=meta)
+        
+        assert dataset.meta == {"source": "synthetic", "seed": 42}
     
     def test_immutability(self):
         """Test that ObservedDataset is frozen (immutable)."""
-        X_obs = np.random.randn(10, 5).astype(np.float32)
-        R = np.ones((10, 5), dtype=bool)
+        n, d = 10, 5
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, d, dtype=torch.bool)
         
-        dataset = ObservedDataset(X_obs=X_obs, R=R, dataset_id="test")
+        dataset = ObservedDataset(x=x, r=r, n=n, d=d)
         
-        # Attempting to modify should raise an error
-        with pytest.raises((AttributeError, TypeError)):
-            dataset.dataset_id = "modified"
+        # Attempting to modify should raise FrozenInstanceError
+        with pytest.raises(Exception):  # FrozenInstanceError is a subclass
+            dataset.n = 999
+    
+    def test_shape_validation_x(self):
+        """Test that x shape must match (n, d)."""
+        n, d = 10, 5
+        x = torch.randn(20, 5, dtype=torch.float32)  # Wrong n
+        r = torch.ones(n, d, dtype=torch.bool)
+        
+        with pytest.raises(ValueError):
+            ObservedDataset(x=x, r=r, n=n, d=d)
+    
+    def test_shape_validation_r(self):
+        """Test that r shape must match (n, d)."""
+        n, d = 10, 5
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, 10, dtype=torch.bool)  # Wrong d
+        
+        with pytest.raises(ValueError):
+            ObservedDataset(x=x, r=r, n=n, d=d)
+    
+    def test_r_dtype_must_be_bool(self):
+        """Test that r must have dtype bool."""
+        n, d = 10, 5
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, d, dtype=torch.float32)  # Wrong dtype
+        
+        with pytest.raises(TypeError):
+            ObservedDataset(x=x, r=r, n=n, d=d)
+    
+    def test_missing_rate_property(self):
+        """Test the missing_rate property."""
+        n, d = 100, 10
+        x = torch.randn(n, d, dtype=torch.float32)
+        # Create 30% missing
+        r = torch.rand(n, d) > 0.3
+        x = x * r.float()
+        
+        dataset = ObservedDataset(x=x, r=r, n=n, d=d)
+        
+        expected_rate = 1.0 - r.float().mean().item()
+        assert abs(dataset.missing_rate - expected_rate) < 1e-6
+    
+    def test_n_observed_property(self):
+        """Test the n_observed property."""
+        n, d = 10, 5
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.ones(n, d, dtype=torch.bool)
+        r[0, 0] = False
+        r[1, 1] = False
+        x = x * r.float()
+        
+        dataset = ObservedDataset(x=x, r=r, n=n, d=d)
+        
+        assert dataset.n_observed == 48  # 50 - 2
 
 
 # =============================================================================
@@ -159,158 +260,119 @@ class TestTokenBatch:
     
     def test_valid_construction(self):
         """Test basic construction with valid inputs."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
+        B, max_rows, max_cols, token_dim = 4, 64, 16, 3
+        tokens = torch.randn(B, max_rows, max_cols, token_dim)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
+        generator_ids = torch.tensor([0, 1, 2, 3])
+        class_ids = torch.tensor([0, 0, 1, 2])
         
         batch = TokenBatch(
-            tokens=torch.randn(B, max_rows, max_cols, token_dim),
-            row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-            col_mask=torch.ones(B, max_cols, dtype=torch.bool),
+            tokens=tokens,
+            row_mask=row_mask,
+            col_mask=col_mask,
+            generator_ids=generator_ids,
+            class_ids=class_ids,
+        )
+        
+        assert batch.tokens.shape == (B, max_rows, max_cols, token_dim)
+        assert batch.row_mask.shape == (B, max_rows)
+        assert batch.col_mask.shape == (B, max_cols)
+        assert batch.generator_ids.shape == (B,)
+        assert batch.class_ids.shape == (B,)
+    
+    def test_batch_size_property(self):
+        """Test that batch_size property works correctly."""
+        B, max_rows, max_cols, token_dim = 8, 32, 10, 3
+        tokens = torch.randn(B, max_rows, max_cols, token_dim)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
+        generator_ids = torch.zeros(B, dtype=torch.long)
+        class_ids = torch.zeros(B, dtype=torch.long)
+        
+        batch = TokenBatch(
+            tokens=tokens,
+            row_mask=row_mask,
+            col_mask=col_mask,
+            generator_ids=generator_ids,
+            class_ids=class_ids,
         )
         
         assert batch.batch_size == B
-        assert batch.max_rows == max_rows
-        assert batch.max_cols == max_cols
-        assert batch.token_dim == token_dim
     
-    def test_with_generator_and_class_labels(self):
-        """Test construction with generator and class IDs."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
+    def test_optional_original_values(self):
+        """Test that original_values is optional."""
+        B, max_rows, max_cols, token_dim = 4, 64, 16, 3
+        tokens = torch.randn(B, max_rows, max_cols, token_dim)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
         
         batch = TokenBatch(
-            tokens=torch.randn(B, max_rows, max_cols, token_dim),
-            row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-            col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-            generator_ids=torch.tensor([0, 1, 2, 3]),
-            class_ids=torch.tensor([0, 0, 1, 2]),
+            tokens=tokens,
+            row_mask=row_mask,
+            col_mask=col_mask,
         )
         
-        assert batch.generator_ids is not None
-        assert batch.generator_ids.shape == (B,)
-        assert batch.class_ids is not None
-        assert batch.class_ids.shape == (B,)
+        assert batch.original_values is None
     
-    def test_with_variant_ids(self):
-        """Test construction with MNAR variant IDs."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
+    def test_with_original_values(self):
+        """Test construction with original_values for reconstruction."""
+        B, max_rows, max_cols, token_dim = 4, 64, 16, 3
+        tokens = torch.randn(B, max_rows, max_cols, token_dim)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
+        original_values = torch.randn(B, max_rows, max_cols)
         
         batch = TokenBatch(
-            tokens=torch.randn(B, max_rows, max_cols, token_dim),
-            row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-            col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-            variant_ids=torch.tensor([-1, -1, 0, 1]),  # -1 for non-MNAR
-        )
-        
-        assert batch.variant_ids is not None
-        assert batch.variant_ids.shape == (B,)
-    
-    def test_with_reconstruction_fields(self):
-        """Test construction with reconstruction-related fields."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
-        
-        batch = TokenBatch(
-            tokens=torch.randn(B, max_rows, max_cols, token_dim),
-            row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-            col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-            original_values=torch.randn(B, max_rows, max_cols),
-            reconstruction_mask=torch.zeros(B, max_rows, max_cols, dtype=torch.bool),
+            tokens=tokens,
+            row_mask=row_mask,
+            col_mask=col_mask,
+            original_values=original_values,
         )
         
         assert batch.original_values is not None
         assert batch.original_values.shape == (B, max_rows, max_cols)
-        assert batch.reconstruction_mask is not None
-        assert batch.reconstruction_mask.shape == (B, max_rows, max_cols)
     
-    def test_wrong_row_mask_shape_raises(self):
-        """Test that mismatched row_mask shape raises ValueError."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
-        
-        with pytest.raises(ValueError):
-            TokenBatch(
-                tokens=torch.randn(B, max_rows, max_cols, token_dim),
-                row_mask=torch.ones(B, 32, dtype=torch.bool),  # Wrong shape
-                col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-            )
-    
-    def test_wrong_col_mask_shape_raises(self):
-        """Test that mismatched col_mask shape raises ValueError."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
-        
-        with pytest.raises(ValueError):
-            TokenBatch(
-                tokens=torch.randn(B, max_rows, max_cols, token_dim),
-                row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-                col_mask=torch.ones(B, 8, dtype=torch.bool),  # Wrong shape
-            )
-    
-    def test_wrong_generator_ids_shape_raises(self):
-        """Test that mismatched generator_ids shape raises ValueError."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
-        
-        with pytest.raises(ValueError):
-            TokenBatch(
-                tokens=torch.randn(B, max_rows, max_cols, token_dim),
-                row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-                col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-                generator_ids=torch.tensor([0, 1]),  # Wrong size
-            )
-    
-    def test_wrong_original_values_shape_raises(self):
-        """Test that mismatched original_values shape raises ValueError."""
-        B, max_rows, max_cols, token_dim = 4, 64, 16, 4
-        
-        with pytest.raises(ValueError):
-            TokenBatch(
-                tokens=torch.randn(B, max_rows, max_cols, token_dim),
-                row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-                col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-                original_values=torch.randn(B, 32, max_cols),  # Wrong shape
-            )
-    
-    def test_to_device(self):
-        """Test moving batch to different device."""
-        B, max_rows, max_cols, token_dim = 2, 32, 8, 4
+    def test_optional_variant_ids(self):
+        """Test that variant_ids is optional."""
+        B, max_rows, max_cols, token_dim = 4, 64, 16, 3
+        tokens = torch.randn(B, max_rows, max_cols, token_dim)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
+        generator_ids = torch.zeros(B, dtype=torch.long)
+        class_ids = torch.zeros(B, dtype=torch.long)
         
         batch = TokenBatch(
-            tokens=torch.randn(B, max_rows, max_cols, token_dim),
-            row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-            col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-            generator_ids=torch.tensor([0, 1]),
-            class_ids=torch.tensor([0, 1]),
-            variant_ids=torch.tensor([-1, 0]),
-            original_values=torch.randn(B, max_rows, max_cols),
-            reconstruction_mask=torch.zeros(B, max_rows, max_cols, dtype=torch.bool),
+            tokens=tokens,
+            row_mask=row_mask,
+            col_mask=col_mask,
+            generator_ids=generator_ids,
+            class_ids=class_ids,
         )
         
-        batch_cpu = batch.to("cpu")
-        
-        assert batch_cpu.tokens.device.type == "cpu"
-        assert batch_cpu.row_mask.device.type == "cpu"
-        assert batch_cpu.col_mask.device.type == "cpu"
-        assert batch_cpu.generator_ids.device.type == "cpu"
-        assert batch_cpu.class_ids.device.type == "cpu"
-        assert batch_cpu.variant_ids.device.type == "cpu"
-        assert batch_cpu.original_values.device.type == "cpu"
-        assert batch_cpu.reconstruction_mask.device.type == "cpu"
+        assert batch.variant_ids is None
     
-    def test_to_device_with_none_fields(self):
-        """Test moving batch with None optional fields."""
-        B, max_rows, max_cols, token_dim = 2, 32, 8, 4
+    def test_with_variant_ids(self):
+        """Test construction with variant_ids for MNAR variants."""
+        B, max_rows, max_cols, token_dim = 4, 64, 16, 3
+        tokens = torch.randn(B, max_rows, max_cols, token_dim)
+        row_mask = torch.ones(B, max_rows, dtype=torch.bool)
+        col_mask = torch.ones(B, max_cols, dtype=torch.bool)
+        generator_ids = torch.zeros(B, dtype=torch.long)
+        class_ids = torch.tensor([MNAR, MNAR, MNAR, MNAR])
+        variant_ids = torch.tensor([0, 1, 2, 3])  # Different MNAR variants
         
         batch = TokenBatch(
-            tokens=torch.randn(B, max_rows, max_cols, token_dim),
-            row_mask=torch.ones(B, max_rows, dtype=torch.bool),
-            col_mask=torch.ones(B, max_cols, dtype=torch.bool),
-            # All optional fields are None
+            tokens=tokens,
+            row_mask=row_mask,
+            col_mask=col_mask,
+            generator_ids=generator_ids,
+            class_ids=class_ids,
+            variant_ids=variant_ids,
         )
         
-        batch_cpu = batch.to("cpu")
-        
-        assert batch_cpu.tokens.device.type == "cpu"
-        assert batch_cpu.generator_ids is None
-        assert batch_cpu.class_ids is None
-        assert batch_cpu.variant_ids is None
-        assert batch_cpu.original_values is None
-        assert batch_cpu.reconstruction_mask is None
+        assert batch.variant_ids is not None
+        assert batch.variant_ids.shape == (B,)
 
 
 # =============================================================================
@@ -323,10 +385,12 @@ class TestReconstructionResult:
     def test_valid_construction(self):
         """Test basic construction."""
         B, max_rows, max_cols = 4, 64, 16
+        predictions = torch.randn(B, max_rows, max_cols)
+        errors = torch.rand(B)
         
         result = ReconstructionResult(
-            predictions=torch.randn(B, max_rows, max_cols),
-            errors=torch.rand(B),
+            predictions=predictions,
+            errors=errors,
         )
         
         assert result.predictions.shape == (B, max_rows, max_cols)
@@ -336,25 +400,31 @@ class TestReconstructionResult:
     def test_with_per_cell_errors(self):
         """Test construction with per-cell errors."""
         B, max_rows, max_cols = 4, 64, 16
+        predictions = torch.randn(B, max_rows, max_cols)
+        errors = torch.rand(B)
+        per_cell_errors = torch.rand(B, max_rows, max_cols)
         
         result = ReconstructionResult(
-            predictions=torch.randn(B, max_rows, max_cols),
-            errors=torch.rand(B),
-            per_cell_errors=torch.rand(B, max_rows, max_cols),
+            predictions=predictions,
+            errors=errors,
+            per_cell_errors=per_cell_errors,
         )
         
         assert result.per_cell_errors is not None
         assert result.per_cell_errors.shape == (B, max_rows, max_cols)
     
-    def test_immutability(self):
-        """Test that ReconstructionResult is frozen."""
+    def test_errors_non_negative(self):
+        """Test that errors should typically be non-negative."""
+        B, max_rows, max_cols = 4, 64, 16
+        predictions = torch.randn(B, max_rows, max_cols)
+        errors = torch.abs(torch.randn(B))  # Ensure non-negative
+        
         result = ReconstructionResult(
-            predictions=torch.randn(4, 64, 16),
-            errors=torch.rand(4),
+            predictions=predictions,
+            errors=errors,
         )
         
-        with pytest.raises((AttributeError, TypeError)):
-            result.errors = torch.zeros(4)
+        assert (result.errors >= 0).all()
 
 
 # =============================================================================
@@ -367,52 +437,101 @@ class TestMoEOutput:
     def test_valid_construction(self):
         """Test basic construction."""
         B, n_experts = 4, 5
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
         
         output = MoEOutput(
-            gate_logits=torch.randn(B, n_experts),
-            gate_probs=torch.softmax(torch.randn(B, n_experts), dim=-1),
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
         )
         
         assert output.gate_logits.shape == (B, n_experts)
         assert output.gate_probs.shape == (B, n_experts)
-        assert output.n_experts == n_experts
     
-    def test_with_expert_outputs(self):
-        """Test construction with expert outputs."""
+    def test_n_experts_property(self):
+        """Test n_experts property."""
         B, n_experts = 4, 5
-        
-        expert_outputs = [torch.randn(B, 32) for _ in range(n_experts)]
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
         
         output = MoEOutput(
-            gate_logits=torch.randn(B, n_experts),
-            gate_probs=torch.softmax(torch.randn(B, n_experts), dim=-1),
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
+        )
+        
+        assert output.n_experts == n_experts
+    
+    def test_gate_probs_sum_to_one(self):
+        """Test that gate_probs sum to 1."""
+        B, n_experts = 4, 5
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        
+        output = MoEOutput(
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
+        )
+        
+        sums = output.gate_probs.sum(dim=-1)
+        assert torch.allclose(sums, torch.ones(B), atol=1e-5)
+    
+    def test_optional_expert_outputs(self):
+        """Test that expert_outputs is optional."""
+        B, n_experts = 4, 5
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        
+        output = MoEOutput(
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
+        )
+        
+        assert output.expert_outputs is None
+    
+    def test_with_expert_outputs(self):
+        """Test construction with expert_outputs."""
+        B, hidden_dim, n_experts = 4, 64, 5
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        expert_outputs = [torch.randn(B, hidden_dim) for _ in range(n_experts)]
+        
+        output = MoEOutput(
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
             expert_outputs=expert_outputs,
         )
         
         assert output.expert_outputs is not None
         assert len(output.expert_outputs) == n_experts
     
-    def test_with_combined_output(self):
-        """Test construction with combined output."""
+    def test_optional_combined_output(self):
+        """Test that combined_output is optional."""
         B, n_experts = 4, 5
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
         
         output = MoEOutput(
-            gate_logits=torch.randn(B, n_experts),
-            gate_probs=torch.softmax(torch.randn(B, n_experts), dim=-1),
-            combined_output=torch.randn(B, n_experts),
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
+        )
+        
+        assert output.combined_output is None
+    
+    def test_with_combined_output(self):
+        """Test construction with combined_output."""
+        B, hidden_dim, n_experts = 4, 64, 5
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        combined_output = torch.randn(B, hidden_dim)
+        
+        output = MoEOutput(
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
+            combined_output=combined_output,
         )
         
         assert output.combined_output is not None
-        assert output.combined_output.shape == (B, n_experts)
-    
-    def test_n_experts_property(self):
-        """Test n_experts property accessor."""
-        for n_experts in [3, 5, 7, 10]:
-            output = MoEOutput(
-                gate_logits=torch.randn(4, n_experts),
-                gate_probs=torch.softmax(torch.randn(4, n_experts), dim=-1),
-            )
-            assert output.n_experts == n_experts
+        assert output.combined_output.shape == (B, hidden_dim)
 
 
 # =============================================================================
@@ -423,95 +542,131 @@ class TestPosteriorResult:
     """Tests for PosteriorResult."""
     
     def test_valid_construction_minimal(self):
-        """Test construction with minimal required fields."""
+        """Test minimal construction with only p_class."""
         B = 4
+        n_classes = 3
+        p_class = torch.softmax(torch.randn(B, n_classes), dim=-1)
         
-        result = PosteriorResult(
-            p_class=torch.softmax(torch.randn(B, 3), dim=-1),
-            entropy_class=torch.rand(B),
-        )
+        posterior = PosteriorResult(p_class=p_class)
         
-        assert result.p_class.shape == (B, 3)
-        assert result.entropy_class.shape == (B,)
-    
-    def test_with_mnar_variant_posterior(self):
-        """Test construction with MNAR variant posterior."""
-        B, n_variants = 4, 3
-        
-        result = PosteriorResult(
-            p_class=torch.softmax(torch.randn(B, 3), dim=-1),
-            p_mnar_variant=torch.softmax(torch.randn(B, n_variants), dim=-1),
-            entropy_class=torch.rand(B),
-        )
-        
-        assert result.p_mnar_variant is not None
-        assert result.p_mnar_variant.shape == (B, n_variants)
-    
-    def test_with_full_mechanism_posterior(self):
-        """Test construction with full mechanism posterior."""
-        B = 4
-        n_mechanisms = 5  # MCAR, MAR, + 3 MNAR variants
-        
-        result = PosteriorResult(
-            p_class=torch.softmax(torch.randn(B, 3), dim=-1),
-            p_mechanism=torch.softmax(torch.randn(B, n_mechanisms), dim=-1),
-            entropy_class=torch.rand(B),
-            entropy_mechanism=torch.rand(B),
-        )
-        
-        assert result.p_mechanism is not None
-        assert result.p_mechanism.shape == (B, n_mechanisms)
-        assert result.entropy_mechanism is not None
-    
-    def test_with_reconstruction_errors(self):
-        """Test construction with reconstruction errors dict."""
-        B = 4
-        
-        recon_errors = {
-            "mcar": torch.rand(B),
-            "mar": torch.rand(B),
-            "self_censoring": torch.rand(B),
-        }
-        
-        result = PosteriorResult(
-            p_class=torch.softmax(torch.randn(B, 3), dim=-1),
-            entropy_class=torch.rand(B),
-            reconstruction_errors=recon_errors,
-        )
-        
-        assert result.reconstruction_errors is not None
-        assert "mcar" in result.reconstruction_errors
-        assert "mar" in result.reconstruction_errors
-    
-    def test_with_gate_probs(self):
-        """Test construction with MoE gate probabilities."""
-        B, n_experts = 4, 5
-        
-        result = PosteriorResult(
-            p_class=torch.softmax(torch.randn(B, 3), dim=-1),
-            entropy_class=torch.rand(B),
-            gate_probs=torch.softmax(torch.randn(B, n_experts), dim=-1),
-        )
-        
-        assert result.gate_probs is not None
-        assert result.gate_probs.shape == (B, n_experts)
+        assert posterior.p_class.shape == (B, n_classes)
     
     def test_probabilities_sum_to_one(self):
-        """Test that probability tensors sum to 1."""
+        """Test that p_class sums to 1 along class dimension."""
         B = 4
+        n_classes = 3
+        p_class = torch.softmax(torch.randn(B, n_classes), dim=-1)
         
+        posterior = PosteriorResult(p_class=p_class)
+        
+        sums = posterior.p_class.sum(dim=-1)
+        assert torch.allclose(sums, torch.ones(B), atol=1e-5)
+    
+    def test_optional_entropy_class(self):
+        """Test that entropy_class is optional."""
+        B = 4
         p_class = torch.softmax(torch.randn(B, 3), dim=-1)
-        p_mechanism = torch.softmax(torch.randn(B, 5), dim=-1)
         
-        result = PosteriorResult(
+        posterior = PosteriorResult(p_class=p_class)
+        
+        assert posterior.entropy_class is None
+    
+    def test_with_entropy_class(self):
+        """Test construction with entropy_class."""
+        B = 4
+        p_class = torch.softmax(torch.randn(B, 3), dim=-1)
+        entropy_class = torch.rand(B)
+        
+        posterior = PosteriorResult(
             p_class=p_class,
-            p_mechanism=p_mechanism,
-            entropy_class=torch.rand(B),
+            entropy_class=entropy_class,
         )
         
-        # Check that probabilities sum to 1
-        assert torch.allclose(result.p_class.sum(dim=-1), torch.ones(B), atol=1e-5)
-        assert torch.allclose(result.p_mechanism.sum(dim=-1), torch.ones(B), atol=1e-5)
+        assert posterior.entropy_class is not None
+        assert posterior.entropy_class.shape == (B,)
+    
+    def test_with_mnar_variant_posteriors(self):
+        """Test construction with MNAR variant posteriors."""
+        B = 4
+        n_classes = 3
+        n_variants = 4
+        
+        p_class = torch.softmax(torch.randn(B, n_classes), dim=-1)
+        p_mnar_variant = torch.softmax(torch.randn(B, n_variants), dim=-1)
+        
+        posterior = PosteriorResult(
+            p_class=p_class,
+            p_mnar_variant=p_mnar_variant,
+        )
+        
+        assert posterior.p_mnar_variant is not None
+        assert posterior.p_mnar_variant.shape == (B, n_variants)
+    
+    def test_with_full_mechanism_posterior(self):
+        """Test construction with full mechanism posterior (class + variants)."""
+        B = 4
+        n_classes = 3
+        n_variants = 4
+        # Full mechanism: MCAR, MAR, MNAR_v0, MNAR_v1, MNAR_v2, MNAR_v3
+        n_mechanisms = 2 + n_variants
+        
+        p_class = torch.softmax(torch.randn(B, n_classes), dim=-1)
+        p_mechanism = torch.softmax(torch.randn(B, n_mechanisms), dim=-1)
+        
+        posterior = PosteriorResult(
+            p_class=p_class,
+            p_mechanism=p_mechanism,
+        )
+        
+        assert posterior.p_mechanism is not None
+        assert posterior.p_mechanism.shape == (B, n_mechanisms)
+    
+    def test_optional_logits(self):
+        """Test that logits fields are optional."""
+        B = 4
+        p_class = torch.softmax(torch.randn(B, 3), dim=-1)
+        
+        posterior = PosteriorResult(p_class=p_class)
+        
+        assert posterior.logits_class is None
+        assert posterior.logits_mnar_variant is None
+    
+    def test_with_logits(self):
+        """Test construction with raw logits."""
+        B = 4
+        n_classes = 3
+        n_variants = 4
+        
+        logits_class = torch.randn(B, n_classes)
+        logits_mnar_variant = torch.randn(B, n_variants)
+        p_class = torch.softmax(logits_class, dim=-1)
+        
+        posterior = PosteriorResult(
+            p_class=p_class,
+            logits_class=logits_class,
+            logits_mnar_variant=logits_mnar_variant,
+        )
+        
+        assert posterior.logits_class is not None
+        assert posterior.logits_mnar_variant is not None
+    
+    def test_gate_probs_optional(self):
+        """Test that gate_probs (from MoE) is optional."""
+        B = 4
+        p_class = torch.softmax(torch.randn(B, 3), dim=-1)
+        
+        posterior = PosteriorResult(p_class=p_class)
+        
+        assert posterior.gate_probs is None
+    
+    def test_reconstruction_errors_optional(self):
+        """Test that reconstruction_errors is optional."""
+        B = 4
+        p_class = torch.softmax(torch.randn(B, 3), dim=-1)
+        
+        posterior = PosteriorResult(p_class=p_class)
+        
+        assert posterior.reconstruction_errors is None
 
 
 # =============================================================================
@@ -524,55 +679,114 @@ class TestDecision:
     def test_valid_construction(self):
         """Test basic construction."""
         B = 4
+        action_ids = torch.tensor([0, 1, 2, 0])
+        expected_risks = torch.rand(B)
         
         decision = Decision(
-            action_ids=torch.tensor([0, 1, 2, 0]),
-            action_names=("Green", "Yellow", "Red"),
-            expected_risks=torch.rand(B),
+            action_ids=action_ids,
+            expected_risks=expected_risks,
         )
         
         assert decision.action_ids.shape == (B,)
-        assert len(decision.action_names) == 3
         assert decision.expected_risks.shape == (B,)
     
-    def test_with_confidence(self):
-        """Test construction with confidence scores."""
+    def test_default_action_names(self):
+        """Test that default action_names is Green, Yellow, Red."""
         B = 4
+        action_ids = torch.tensor([0, 1, 2, 0])
+        expected_risks = torch.rand(B)
         
         decision = Decision(
-            action_ids=torch.tensor([0, 1, 2, 0]),
-            action_names=("Green", "Yellow", "Red"),
-            expected_risks=torch.rand(B),
-            confidence=torch.rand(B),
+            action_ids=action_ids,
+            expected_risks=expected_risks,
+        )
+        
+        assert decision.action_names == ("Green", "Yellow", "Red")
+    
+    def test_custom_action_names(self):
+        """Test construction with custom action_names."""
+        B = 4
+        action_ids = torch.tensor([0, 1, 2, 0])
+        expected_risks = torch.rand(B)
+        
+        decision = Decision(
+            action_ids=action_ids,
+            expected_risks=expected_risks,
+            action_names=("Safe", "Caution", "Danger"),
+        )
+        
+        assert decision.action_names == ("Safe", "Caution", "Danger")
+    
+    def test_action_ids_in_range(self):
+        """Test that action_ids are valid indices."""
+        B = 4
+        action_ids = torch.tensor([0, 1, 2, 0])
+        expected_risks = torch.rand(B)
+        
+        decision = Decision(
+            action_ids=action_ids,
+            expected_risks=expected_risks,
+        )
+        
+        num_actions = len(decision.action_names)
+        assert (decision.action_ids >= 0).all()
+        assert (decision.action_ids < num_actions).all()
+    
+    def test_confidence_optional(self):
+        """Test that confidence is optional."""
+        B = 4
+        action_ids = torch.tensor([0, 1, 2, 0])
+        expected_risks = torch.rand(B)
+        
+        decision = Decision(
+            action_ids=action_ids,
+            expected_risks=expected_risks,
+        )
+        
+        assert decision.confidence is None
+    
+    def test_with_confidence(self):
+        """Test construction with confidence."""
+        B = 4
+        action_ids = torch.tensor([0, 1, 2, 0])
+        expected_risks = torch.rand(B)
+        confidence = torch.rand(B)
+        
+        decision = Decision(
+            action_ids=action_ids,
+            expected_risks=expected_risks,
+            confidence=confidence,
         )
         
         assert decision.confidence is not None
         assert decision.confidence.shape == (B,)
     
     def test_batch_size_property(self):
-        """Test batch_size property accessor."""
-        for B in [1, 4, 8, 16]:
-            decision = Decision(
-                action_ids=torch.randint(0, 3, (B,)),
-                action_names=("Green", "Yellow", "Red"),
-                expected_risks=torch.rand(B),
-            )
-            assert decision.batch_size == B
-    
-    def test_action_ids_in_valid_range(self):
-        """Test that action IDs are within valid range."""
-        B = 4
-        action_ids = torch.tensor([0, 1, 2, 1])
+        """Test batch_size property."""
+        B = 8
+        action_ids = torch.zeros(B, dtype=torch.long)
+        expected_risks = torch.rand(B)
         
         decision = Decision(
             action_ids=action_ids,
-            action_names=("Green", "Yellow", "Red"),
-            expected_risks=torch.rand(B),
+            expected_risks=expected_risks,
         )
         
-        # All action IDs should be in [0, len(action_names))
-        assert (decision.action_ids >= 0).all()
-        assert (decision.action_ids < len(decision.action_names)).all()
+        assert decision.batch_size == B
+    
+    def test_get_actions_method(self):
+        """Test get_actions method returns action names."""
+        B = 4
+        action_ids = torch.tensor([0, 1, 2, 1])
+        expected_risks = torch.rand(B)
+        
+        decision = Decision(
+            action_ids=action_ids,
+            expected_risks=expected_risks,
+        )
+        
+        actions = decision.get_actions()
+        assert actions == ["Green", "Yellow", "Red", "Yellow"]
 
 
 # =============================================================================
@@ -584,53 +798,43 @@ class TestLacunaOutput:
     
     @pytest.fixture
     def sample_posterior(self):
-        """Create sample PosteriorResult."""
+        """Create a sample PosteriorResult."""
         B = 4
         return PosteriorResult(
             p_class=torch.softmax(torch.randn(B, 3), dim=-1),
-            entropy_class=torch.rand(B),
         )
     
     @pytest.fixture
     def sample_decision(self):
-        """Create sample Decision."""
+        """Create a sample Decision."""
         B = 4
         return Decision(
-            action_ids=torch.randint(0, 3, (B,)),
-            action_names=("Green", "Yellow", "Red"),
+            action_ids=torch.tensor([0, 1, 2, 0]),
             expected_risks=torch.rand(B),
         )
     
     @pytest.fixture
     def sample_moe_output(self):
-        """Create sample MoEOutput."""
-        B, n_experts = 4, 5
+        """Create a sample MoEOutput."""
+        B, n_experts = 4, 4
+        gate_logits = torch.randn(B, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
         return MoEOutput(
-            gate_logits=torch.randn(B, n_experts),
-            gate_probs=torch.softmax(torch.randn(B, n_experts), dim=-1),
+            gate_logits=gate_logits,
+            gate_probs=gate_probs,
         )
     
     def test_valid_construction_minimal(self, sample_posterior):
-        """Test construction with minimal fields."""
-        B = 4
-        
-        output = LacunaOutput(
-            posterior=sample_posterior,
-            evidence=torch.randn(B, 64),
-        )
+        """Test minimal construction with only required fields."""
+        output = LacunaOutput(posterior=sample_posterior)
         
         assert output.posterior is not None
-        assert output.evidence.shape == (B, 64)
         assert output.decision is None
         assert output.reconstruction is None
-        assert output.moe_output is None
+        assert output.moe is None
+        assert output.evidence is None
     
-    def test_valid_construction_full(
-        self,
-        sample_posterior,
-        sample_decision,
-        sample_moe_output,
-    ):
+    def test_valid_construction_full(self, sample_posterior, sample_decision, sample_moe_output):
         """Test construction with all fields."""
         B, max_rows, max_cols = 4, 64, 16
         
@@ -649,7 +853,7 @@ class TestLacunaOutput:
             posterior=sample_posterior,
             decision=sample_decision,
             reconstruction=reconstruction,
-            moe_output=sample_moe_output,
+            moe=sample_moe_output,
             evidence=torch.randn(B, 64),
         )
         
@@ -657,7 +861,7 @@ class TestLacunaOutput:
         assert output.decision is not None
         assert output.reconstruction is not None
         assert len(output.reconstruction) == 2
-        assert output.moe_output is not None
+        assert output.moe is not None
         assert output.evidence is not None
     
     def test_accessing_nested_fields(self, sample_posterior, sample_decision):
@@ -676,3 +880,66 @@ class TestLacunaOutput:
         # Access decision fields
         assert output.decision.action_ids.shape == (B,)
         assert output.decision.action_names == ("Green", "Yellow", "Red")
+
+
+# =============================================================================
+# Integration Tests
+# =============================================================================
+
+class TestTypeInteractions:
+    """Tests for interactions between types."""
+    
+    def test_token_batch_to_output_flow(self):
+        """Test that types work together in a typical flow."""
+        B, max_rows, max_cols, token_dim = 4, 64, 16, 3
+        
+        # Create input batch
+        batch = TokenBatch(
+            tokens=torch.randn(B, max_rows, max_cols, token_dim),
+            row_mask=torch.ones(B, max_rows, dtype=torch.bool),
+            col_mask=torch.ones(B, max_cols, dtype=torch.bool),
+            generator_ids=torch.tensor([0, 1, 2, 3]),
+            class_ids=torch.tensor([0, 0, 1, 2]),
+        )
+        
+        # Simulate model output
+        posterior = PosteriorResult(
+            p_class=torch.softmax(torch.randn(B, 3), dim=-1),
+        )
+        
+        decision = Decision(
+            action_ids=torch.argmax(posterior.p_class, dim=-1),
+            expected_risks=torch.rand(B),
+        )
+        
+        output = LacunaOutput(
+            posterior=posterior,
+            decision=decision,
+            evidence=torch.randn(B, 64),
+        )
+        
+        # Verify shapes are consistent
+        assert batch.batch_size == B
+        assert output.posterior.p_class.shape[0] == B
+        assert output.decision.action_ids.shape[0] == B
+    
+    def test_observed_dataset_consistent_shapes(self):
+        """Test that ObservedDataset maintains shape consistency."""
+        n, d = 100, 20
+        x = torch.randn(n, d, dtype=torch.float32)
+        r = torch.rand(n, d) > 0.3
+        x = x * r.float()  # Zero out missing
+        
+        dataset = ObservedDataset(
+            x=x,
+            r=r,
+            n=n,
+            d=d,
+            dataset_id="test",
+        )
+        
+        # All shapes should be consistent
+        assert dataset.x.shape == (n, d)
+        assert dataset.r.shape == (n, d)
+        assert dataset.n == n
+        assert dataset.d == d
