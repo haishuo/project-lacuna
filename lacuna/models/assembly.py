@@ -494,7 +494,7 @@ class LacunaModel(nn.Module):
             posterior=posterior,
             decision=decision,
             reconstruction=reconstruction_results,
-            moe_output=moe_output,
+            moe=moe_output,
             evidence=evidence,
         )
     
