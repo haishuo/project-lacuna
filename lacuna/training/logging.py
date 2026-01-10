@@ -20,25 +20,23 @@ def create_logger(output_dir: Path) -> Callable[[dict], None]:
     log_file = output_dir / "logs" / "training.log"
     
     def log(metrics: dict):
-        step = metrics.get("step", metrics.get("epoch", "?"))
-        
         if "val_loss" in metrics:
-            # End of epoch validation summary
+            # Validation metrics - show per-class accuracy breakdown
             epoch = metrics.get('epoch', '?')
             epoch_str = f"{epoch:3d}" if isinstance(epoch, int) else str(epoch)
+            
+            # Get per-class accuracies (these are what validate() actually returns)
+            mcar_acc = metrics.get('val_mcar_acc', 0)
+            mar_acc = metrics.get('val_mar_acc', 0)
+            mnar_acc = metrics.get('val_mnar_acc', 0)
+            overall_acc = metrics.get('val_acc', 0)
+            
             print(f"  Epoch {epoch_str} | "
-                  f"train_loss: {metrics.get('train_loss', 0):.4f} | "
                   f"val_loss: {metrics['val_loss']:.4f} | "
-                  f"val_acc_gen: {metrics.get('val_acc_generator', 0)*100:.1f}% | "
-                  f"val_acc_cls: {metrics.get('val_acc_class', 0)*100:.1f}%")
-        elif "loss_total" in metrics:
-            # Training step (log periodically)
-            step_num = metrics.get("step", 0)
-            if step_num % 50 == 0:
-                print(f"  Step {step_num:5d} | "
-                      f"loss: {metrics['loss_total']:.4f} | "
-                      f"acc_gen: {metrics.get('acc_generator', 0)*100:.1f}% | "
-                      f"lr: {metrics.get('lr', 0):.2e}")
+                  f"val_acc: {overall_acc*100:.1f}% | "
+                  f"MCAR: {mcar_acc*100:.1f}% | "
+                  f"MAR: {mar_acc*100:.1f}% | "
+                  f"MNAR: {mnar_acc*100:.1f}%")
         
         # Write all metrics to log file
         log_file.parent.mkdir(parents=True, exist_ok=True)

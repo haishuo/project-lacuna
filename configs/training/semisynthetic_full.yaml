@@ -1,43 +1,57 @@
-# Semi-synthetic training with all 27 downloaded datasets
+# Full semi-synthetic training config with all available datasets
+# Uses 80% for training, 20% for validation
+#
+# Usage: python scripts/train_semisynthetic.py --config configs/training/semisynthetic_full.yaml --device cuda
+
 seed: 42
 device: cuda
 output_dir: /mnt/artifacts/project_lacuna/runs
 
 data:
   max_rows: 128
-  max_cols: 82  # For superconductor (82 features)
+  max_cols: 48
+  
+  # Training datasets (80% - 24 datasets)
   train_datasets:
-    # Large (7)
+    # Large datasets (>10k samples)
     - credit_card_default
     - superconductor
-    - letter_recognition
     - magic_telescope
+    - pulsar_stars
     - avocado_prices
     - bike_sharing
-    - pendigits
-    # Medium (13)
-    - pulsar_stars
-    - wine_quality_red
-    - satellite
+    - letter_recognition
     - optical_digits
-    - page_blocks
-    - wine_white
+    - satellite
     - spambase
+    - pendigits
+    
+    # Medium datasets (1k-10k samples)
     - abalone
     - cardiotocography
+    - page_blocks
     - steel_plates
+    - wine_quality_red
+    - wine_white
     - yeast
-    - banknote
     - concrete
-    # Small (6) - leave one for validation
-    - vehicle
-    - ionosphere
-    - ecoli
-    - glass
+    
+    # Small datasets (<1k samples) - sklearn built-ins
+    - breast_cancer
+    - diabetes
+    - wine
     - parkinsons
-    - heart_disease
+    - vehicle
+  
+  # Validation datasets (20% - 6 datasets, diverse sizes)
   val_datasets:
-    - segmentation  # Hold out for validation
+    - banknote
+    - heart_disease
+    - ionosphere
+    - segmentation
+    - glass
+    - ecoli
+    - iris
 
 model:
   hidden_dim: 128
@@ -47,14 +61,14 @@ model:
   dropout: 0.1
 
 training:
-  epochs: 30
-  batch_size: 64
-  batches_per_epoch: 50
-  val_batches: 10
+  epochs: 50
+  batch_size: 16
+  batches_per_epoch: 100
+  val_batches: 20
   lr: 0.0003
   weight_decay: 0.01
   grad_clip: 1.0
-  warmup_steps: 100
+  warmup_steps: 200
   patience: 10
   min_delta: 0.001
 

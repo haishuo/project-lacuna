@@ -1,0 +1,70 @@
+# Balanced semi-synthetic config with better train/val distribution
+# Mixed dataset sizes in both splits to prevent distribution shift
+#
+# Usage: python scripts/train_semisynthetic.py --config configs/training/semisynthetic_balanced.yaml --device cuda
+
+seed: 42
+device: cuda
+output_dir: /mnt/artifacts/project_lacuna/runs
+
+data:
+  max_rows: 128
+  max_cols: 48
+  
+  # Training datasets - mix of sizes (18 datasets)
+  train_datasets:
+    # Large
+    - credit_card_default
+    - magic_telescope
+    - avocado_prices
+    - bike_sharing
+    - letter_recognition
+    - pendigits
+    # Medium
+    - satellite
+    - abalone
+    - page_blocks
+    - wine_quality_red
+    - wine_white
+    - cardiotocography
+    # Small
+    - breast_cancer
+    - diabetes
+    - wine
+    - concrete
+    - vehicle
+    - yeast
+  
+  # Validation datasets - also mix of sizes (6 datasets)
+  val_datasets:
+    # Large (held out)
+    - pulsar_stars
+    # Medium
+    - steel_plates
+    - banknote
+    # Small
+    - heart_disease
+    - ionosphere
+    - parkinsons
+
+model:
+  hidden_dim: 128
+  evidence_dim: 64
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.2  # Increased dropout for regularization
+
+training:
+  epochs: 100
+  batch_size: 16
+  batches_per_epoch: 100
+  val_batches: 30  # More validation batches for stable estimates
+  lr: 0.0001  # Lower learning rate
+  weight_decay: 0.05  # Stronger weight decay
+  grad_clip: 1.0
+  warmup_steps: 500  # Longer warmup
+  patience: 15  # More patience
+  min_delta: 0.001
+
+generator:
+  n_generators: 6
